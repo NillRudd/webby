@@ -1,0 +1,31 @@
+[workspace]
+members = [
+    "crates/webby_core",
+    "crates/webby_url",
+    "crates/webby_net",
+    "crates/webby_dom",
+    "crates/webby_html",
+    "crates/webby_css",
+    "crates/webby_style",
+    "crates/webby_layout",
+    "crates/webby_render",
+    "crates/webby_app",
+    "crates/webby_cli",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = ""
+
+[workspace.dependencies]
+thiserror = "2"
+url = "2"
+urlencoding = "2"
+reqwest = { version = "0.12", features = ["blocking", "rustls-tls"], default-features = false }
+clap = { version = "4", features = ["derive"] }
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"
