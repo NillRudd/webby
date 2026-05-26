@@ -1,0 +1,17 @@
+[package]
+name = "webby_script"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+url.workspace = true
+webby_core.workspace = true
+webby_dom.workspace = true
+webby_html.workspace = true
+webby_js.workspace = true
+webby_net.workspace = true
+
+[lints]
+workspace = true

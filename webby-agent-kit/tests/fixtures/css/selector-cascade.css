@@ -1,0 +1,21 @@
+* {
+  color: #111111;
+}
+
+.card p {
+  color: #334455;
+}
+
+.card > p {
+  font-weight: bold;
+}
+
+.card.highlighted [data-kind="primary"] {
+  color: #aa0000;
+  text-decoration: underline;
+}
+
+#main-card {
+  background-color: #eef6ff;
+  padding: 4px;
+}

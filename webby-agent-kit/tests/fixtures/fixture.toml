@@ -1,0 +1,52 @@
+# Fixture manifest for humans and future tooling.
+#
+# The current test suite reads fixture files directly through public Webby
+# APIs. This manifest documents the stable entry points without adding another
+# parser dependency.
+
+[[site]]
+name = "static-blog"
+start_url = "sites/static-blog/index.html"
+expected_text = "expected/static-blog-visible-text.txt"
+
+[[site]]
+name = "image-gallery"
+start_url = "sites/image-gallery/index.html"
+
+[[site]]
+name = "form-search"
+start_url = "sites/form-search/index.html"
+
+[[site]]
+name = "layout-showcase"
+start_url = "sites/layout-showcase/index.html"
+
+[[site]]
+name = "js-todo"
+start_url = "sites/js-todo/index.html"
+expected_text = "Todo Fixture"
+
+[[site]]
+name = "dynamic-fetch-storage"
+start_url = "sites/dynamic-fetch-storage/index.html"
+expected_text = "Fetched fixture data / session ok"
+
+[[regression]]
+name = "raw-text-close-lookalikes"
+path = "regressions/raw-text-lookalikes.html"
+
+[[regression]]
+name = "malformed-selectors"
+path = "regressions/malformed-selectors.html"
+
+[[regression]]
+name = "external-stylesheet-diagnostics"
+path = "regressions/external-diagnostics.html"
+
+[[regression]]
+name = "image-decode-fallback"
+path = "regressions/image-decode-fallback.html"
+
+[[regression]]
+name = "form-get-serialization"
+path = "regressions/form-get.html"

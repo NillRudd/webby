@@ -1,0 +1,7 @@
+Webby Field Notes
+Home
+About
+Building a Tiny Browser
+Webby renders local fixtures with real parsing, styling, layout, display-list generation, and software rendering.
+Read the about page for project goals.
+Fixture blog footer

@@ -1,0 +1,15 @@
+body {
+  background: #fff7ed;
+  color: #1f2937;
+  margin: 8px;
+}
+
+form {
+  border: 1px solid #fb923c;
+  padding: 8px;
+}
+
+input {
+  border: 1px solid #9ca3af;
+  padding: 4px;
+}

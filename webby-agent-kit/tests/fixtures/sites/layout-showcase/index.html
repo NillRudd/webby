@@ -1,0 +1,46 @@
+<!doctype html>
+<html>
+  <head>
+    <title>Layout Showcase</title>
+    <link rel="stylesheet" href="style.css">
+  </head>
+  <body>
+    <h1>Layout Showcase</h1>
+    <div class="showcase">
+      <div class="card">
+        <h2>Block and inline flow</h2>
+        <p>
+          Text before
+          <span class="badge">nested <a href="details.html"><span>inline link</span></a></span>
+          <img src="../static-blog/cover.png" alt="inline image" width="10" height="10">
+          text after image.
+        </p>
+        <p><a href="details.html">Multi word wrapped link target</a> follows text.</p>
+      </div>
+      <div class="card">
+        <h2>Documentation elements</h2>
+        <ul>
+          <li><strong>Bold list item</strong> with <code>inline_code()</code></li>
+          <li><em>Emphasized text</em> and <small>small print</small></li>
+        </ul>
+        <pre>fn main() {
+  let message = "webby";
+}</pre>
+        <blockquote>Blockquote styling keeps quoted text visually distinct.</blockquote>
+        <hr>
+      </div>
+      <div class="card">
+        <h2>Simple table</h2>
+        <table>
+          <thead>
+            <tr><th>Feature</th><th>Status</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>Tables</td><td>v0.1</td></tr>
+            <tr><td>Lists</td><td>deterministic markers</td></tr>
+          </tbody>
+        </table>
+      </div>
+    </div>
+  </body>
+</html>

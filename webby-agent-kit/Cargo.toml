@@ -1,0 +1,63 @@
+[workspace]
+members = [
+    "crates/webby_core",
+    "crates/webby_url",
+    "crates/webby_net",
+    "crates/webby_security",
+    "crates/webby_dom",
+    "crates/webby_html",
+    "crates/webby_css",
+    "crates/webby_cache",
+    "crates/webby_stylesheet",
+    "crates/webby_script",
+    "crates/webby_js",
+    "crates/webby_state",
+    "crates/webby_style",
+    "crates/webby_text",
+    "crates/webby_image",
+    "crates/webby_layout",
+    "crates/webby_render",
+    "crates/webby_app",
+    "crates/webby_cli",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "MIT OR Apache-2.0"
+repository = ""
+
+[workspace.dependencies]
+thiserror = "2"
+url = "2"
+urlencoding = "2"
+reqwest = { version = "0.12", features = ["blocking", "rustls-tls"], default-features = false }
+clap = { version = "4", features = ["derive"] }
+minifb = "0.27"
+fontdue = "0.9"
+image = { version = "0.25", default-features = false, features = ["jpeg", "png"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+boa_engine = "0.21.1"
+base64 = "0.22"
+webby_core = { path = "crates/webby_core" }
+webby_url = { path = "crates/webby_url" }
+webby_net = { path = "crates/webby_net" }
+webby_security = { path = "crates/webby_security" }
+webby_dom = { path = "crates/webby_dom" }
+webby_html = { path = "crates/webby_html" }
+webby_css = { path = "crates/webby_css" }
+webby_cache = { path = "crates/webby_cache" }
+webby_stylesheet = { path = "crates/webby_stylesheet" }
+webby_script = { path = "crates/webby_script" }
+webby_js = { path = "crates/webby_js" }
+webby_state = { path = "crates/webby_state" }
+webby_style = { path = "crates/webby_style" }
+webby_text = { path = "crates/webby_text" }
+webby_image = { path = "crates/webby_image" }
+webby_layout = { path = "crates/webby_layout" }
+webby_render = { path = "crates/webby_render" }
+
+[workspace.lints.clippy]
+unwrap_used = "warn"
+expect_used = "warn"

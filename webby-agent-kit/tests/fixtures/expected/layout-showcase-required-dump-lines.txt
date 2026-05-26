@@ -1,0 +1,5 @@
+layout scroll-height=
+line rect=
+kind=image
+links
+href="details.html"

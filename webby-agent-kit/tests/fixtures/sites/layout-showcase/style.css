@@ -1,0 +1,39 @@
+body {
+  margin: 6px;
+  background-color: #f8fafc;
+  color: #0f172a;
+}
+
+.showcase {
+  padding: 6px;
+}
+
+.card {
+  margin: 8px;
+  padding: 8px;
+  border: 2px solid #64748b;
+  background-color: #ffffff;
+}
+
+.badge {
+  color: #be123c;
+  font-weight: bold;
+}
+
+pre {
+  border: 1px solid #94a3b8;
+  background-color: #f1f5f9;
+}
+
+blockquote {
+  background-color: #f8fafc;
+}
+
+table {
+  margin: 8px 0;
+}
+
+a {
+  color: #2563eb;
+  text-decoration: underline;
+}

@@ -1,0 +1,20 @@
+<!doctype html>
+<html>
+  <head>
+    <title>Webby Dynamic Fixture</title>
+    <link rel="stylesheet" href="style.css">
+  </head>
+  <body>
+    <main>
+      <h1>Dynamic Fetch Storage Fixture</h1>
+      <p id="status">Waiting for script</p>
+    </main>
+    <script>
+      var loaded = fetch('message.txt').text();
+      localStorage.setItem('fixture-message', loaded);
+      sessionStorage.setItem('fixture-session', 'session ok');
+      document.getElementById('status').textContent =
+        localStorage.getItem('fixture-message') + ' / ' + sessionStorage.getItem('fixture-session');
+    </script>
+  </body>
+</html>

@@ -1,0 +1,32 @@
+[package]
+name = "webby_cli"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+clap.workspace = true
+url.workspace = true
+webby_cache.workspace = true
+webby_core.workspace = true
+webby_css.workspace = true
+webby_dom.workspace = true
+webby_html.workspace = true
+webby_image.workspace = true
+webby_js.workspace = true
+webby_layout.workspace = true
+webby_net.workspace = true
+webby_render.workspace = true
+webby_state.workspace = true
+webby_style.workspace = true
+webby_stylesheet.workspace = true
+webby_script.workspace = true
+webby_url.workspace = true
+
+[dev-dependencies]
+base64.workspace = true
+image.workspace = true
+
+[lints]
+workspace = true

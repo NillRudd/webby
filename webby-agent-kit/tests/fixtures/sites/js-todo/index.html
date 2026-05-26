@@ -1,0 +1,22 @@
+<!doctype html>
+<html>
+  <head>
+    <title>Webby Todo Fixture</title>
+    <link rel="stylesheet" href="style.css">
+  </head>
+  <body>
+    <main>
+      <h1>Todo Fixture</h1>
+      <p id="status">Initial task</p>
+      <input id="new-task" type="text" value="Write fixture tests">
+      <button id="add-task" type="button">Add task</button>
+    </main>
+    <script>
+      document.getElementById('add-task').addEventListener('click', function(event) {
+        event.preventDefault();
+        document.getElementById('status').textContent =
+          document.getElementById('new-task').getAttribute('value') + ' done';
+      });
+    </script>
+  </body>
+</html>

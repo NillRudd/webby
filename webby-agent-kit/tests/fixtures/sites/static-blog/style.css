@@ -1,0 +1,28 @@
+body {
+  background: #f7fbff;
+  color: #14213d;
+  font-size: 15px;
+  margin: 10px;
+}
+
+.masthead {
+  background-color: #dbeafe;
+  border: 2px solid #2563eb;
+  padding: 6px;
+}
+
+nav a {
+  color: #0f766e;
+  text-decoration: underline;
+}
+
+article.post {
+  background-color: #ffffff;
+  border: 1px solid #94a3b8;
+  margin: 8px;
+  padding: 8px;
+}
+
+#first-post {
+  color: #1f2937;
+}
