@@ -1,0 +1,4 @@
+body { margin: 12px; background-color: #f5f3ff; color: #312e81; }
+main { width: 260px; padding: 10px; border: 2px solid #7c3aed; }
+label { display: block; margin: 4px; }
+input { display: block; margin: 4px; width: 200px; }

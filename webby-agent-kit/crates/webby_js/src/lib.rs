@@ -29,6 +29,8 @@ const MUTATION_SNAPSHOT: &str = "JSON.stringify(__webby_mutations)";
 const EVENT_HANDLER_SNAPSHOT: &str = "JSON.stringify(__webby_event_handlers)";
 const BROWSER_ACTION_SNAPSHOT: &str = "JSON.stringify(__webby_browser_actions)";
 const STORAGE_ACTION_SNAPSHOT: &str = "JSON.stringify(__webby_storage_actions)";
+const CUSTOM_ELEMENT_DIAGNOSTIC_SNAPSHOT: &str =
+    "JSON.stringify(__webby_custom_element_diagnostics)";
 
 /// One script supplied to the JavaScript executor.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -451,6 +453,7 @@ pub fn execute_scripts_with_dom(
     let mutation_report = apply_dom_mutations(document, &mut context)?;
     diagnostics.extend(mutation_report.diagnostics);
     let event_handlers = read_event_handlers(&mut context)?;
+    diagnostics.extend(read_custom_element_diagnostics(&mut context)?);
     diagnostics.extend(read_console_log(&mut context)?);
     Ok(ExecutionReport {
         diagnostics,
@@ -498,6 +501,7 @@ pub fn execute_scripts_with_dom_and_browser(
     let event_handlers = read_event_handlers(&mut context)?;
     let browser_actions = read_browser_actions(&mut context)?;
     let storage_actions = read_storage_actions(&mut context)?;
+    diagnostics.extend(read_custom_element_diagnostics(&mut context)?);
     diagnostics.extend(read_console_log(&mut context)?);
     Ok(ExecutionReport {
         diagnostics,
@@ -559,6 +563,7 @@ pub fn dispatch_event_with_dom_and_browser(
     }
     let mutation_report = apply_dom_mutations(document, &mut context)?;
     diagnostics.extend(mutation_report.diagnostics);
+    diagnostics.extend(read_custom_element_diagnostics(&mut context)?);
     diagnostics.extend(read_console_log(&mut context)?);
     let default_prevented = read_bool(&mut context, "__webby_default_prevented")?;
     let browser_actions = read_browser_actions(&mut context)?;
@@ -608,6 +613,7 @@ pub fn execute_timer_callback_with_dom(
     let event_handlers = read_event_handlers(&mut context)?;
     let browser_actions = read_browser_actions(&mut context)?;
     let storage_actions = read_storage_actions(&mut context)?;
+    diagnostics.extend(read_custom_element_diagnostics(&mut context)?);
     diagnostics.extend(read_console_log(&mut context)?);
     Ok(ExecutionReport {
         diagnostics,
@@ -1021,6 +1027,7 @@ struct MirrorNode {
     text: String,
     attributes: BTreeMap<String, String>,
     children: Vec<MirrorNode>,
+    shadow_children: Vec<MirrorNode>,
 }
 
 fn mirror_node(node: &Node) -> MirrorNode {
@@ -1032,6 +1039,7 @@ fn mirror_node(node: &Node) -> MirrorNode {
             text: String::new(),
             attributes: BTreeMap::new(),
             children: node.children.iter().map(mirror_node).collect(),
+            shadow_children: node.shadow_children.iter().map(mirror_node).collect(),
         },
         NodeKind::Element(element) => MirrorNode {
             id: node.id.to_string(),
@@ -1040,6 +1048,7 @@ fn mirror_node(node: &Node) -> MirrorNode {
             text: String::new(),
             attributes: element.attributes.clone(),
             children: node.children.iter().map(mirror_node).collect(),
+            shadow_children: node.shadow_children.iter().map(mirror_node).collect(),
         },
         NodeKind::Text(text) => MirrorNode {
             id: node.id.to_string(),
@@ -1048,6 +1057,7 @@ fn mirror_node(node: &Node) -> MirrorNode {
             text: text.clone(),
             attributes: BTreeMap::new(),
             children: Vec::new(),
+            shadow_children: Vec::new(),
         },
     }
 }
@@ -1063,6 +1073,10 @@ enum DomMutation {
     SetTextContent { id: String, text: String },
     #[serde(rename = "appendChild")]
     AppendChild { parent: String, child: String },
+    #[serde(rename = "attachShadow")]
+    AttachShadow { host: String, mode: String },
+    #[serde(rename = "appendShadowChild")]
+    AppendShadowChild { host: String, child: String },
     #[serde(rename = "remove")]
     Remove { id: String },
     #[serde(rename = "setAttribute")]
@@ -1094,11 +1108,18 @@ fn apply_dom_mutations(
             message: format!("JavaScript DOM mutation JSON parse failed: {error}"),
         })?;
     let mut created = HashMap::new();
+    let mut aliases = HashMap::new();
     let mut diagnostics = Vec::new();
     let mut dirty = DirtyState::default();
     let mut next_id = document.next_node_id();
     for operation in operations {
-        match apply_dom_mutation(document, &mut created, &mut next_id, operation) {
+        match apply_dom_mutation(
+            document,
+            &mut created,
+            &mut aliases,
+            &mut next_id,
+            operation,
+        ) {
             Ok(operation_dirty) => dirty.merge(operation_dirty),
             Err(diagnostic) => diagnostics.push(diagnostic),
         }
@@ -1109,6 +1130,7 @@ fn apply_dom_mutations(
 fn apply_dom_mutation(
     document: &mut Document,
     created: &mut HashMap<String, Node>,
+    aliases: &mut HashMap<String, NodeId>,
     next_id: &mut NodeId,
     operation: DomMutation,
 ) -> Result<DirtyState, String> {
@@ -1130,7 +1152,7 @@ fn apply_dom_mutation(
                 set_created_text_content(node, text, next_id);
                 return Ok(DirtyState::default());
             }
-            let Some(node_id) = parse_existing_id(&id) else {
+            let Some(node_id) = resolve_mutation_id(&id, aliases) else {
                 return Err(format!("JavaScript DOM mutation skipped invalid node {id}"));
             };
             if document.set_text_content(node_id, text) {
@@ -1143,23 +1165,26 @@ fn apply_dom_mutation(
             let child_node = if let Some(node) = created.remove(&child) {
                 Some(node)
             } else {
-                parse_existing_id(&child).and_then(|node_id| document.remove_node(node_id))
+                resolve_mutation_id(&child, aliases)
+                    .and_then(|node_id| document.remove_node(node_id))
             };
             let Some(child_node) = child_node else {
                 return Err(format!(
                     "JavaScript DOM mutation skipped missing child {child}"
                 ));
             };
+            let child_node_id = child_node.id;
             if let Some(parent_node) = created.get_mut(&parent) {
                 parent_node.children.push(child_node);
                 return Ok(DirtyState::default());
             }
-            let Some(parent_id) = parse_existing_id(&parent) else {
+            let Some(parent_id) = resolve_mutation_id(&parent, aliases) else {
                 return Err(format!(
                     "JavaScript DOM mutation skipped invalid parent {parent}"
                 ));
             };
             if document.append_child(parent_id, child_node) {
+                aliases.insert(child, child_node_id);
                 Ok(DirtyState::all())
             } else {
                 Err(format!(
@@ -1167,9 +1192,63 @@ fn apply_dom_mutation(
                 ))
             }
         }
+        DomMutation::AttachShadow { host, mode } => {
+            if mode != "open" {
+                return Err(format!(
+                    "JavaScript Shadow DOM attachShadow skipped unsupported mode {mode:?}"
+                ));
+            }
+            if let Some(host_node) = created.get_mut(&host) {
+                host_node.shadow_children.clear();
+                return Ok(DirtyState::default());
+            }
+            let Some(host_id) = resolve_mutation_id(&host, aliases) else {
+                return Err(format!(
+                    "JavaScript Shadow DOM attachShadow skipped invalid host {host}"
+                ));
+            };
+            if document.attach_shadow_root(host_id) {
+                Ok(DirtyState::all())
+            } else {
+                Err(format!(
+                    "JavaScript Shadow DOM attachShadow skipped missing host {host}"
+                ))
+            }
+        }
+        DomMutation::AppendShadowChild { host, child } => {
+            let child_node = if let Some(node) = created.remove(&child) {
+                Some(node)
+            } else {
+                resolve_mutation_id(&child, aliases)
+                    .and_then(|node_id| document.remove_node(node_id))
+            };
+            let Some(child_node) = child_node else {
+                return Err(format!(
+                    "JavaScript Shadow DOM mutation skipped missing child {child}"
+                ));
+            };
+            let child_node_id = child_node.id;
+            if let Some(host_node) = created.get_mut(&host) {
+                host_node.shadow_children.push(child_node);
+                return Ok(DirtyState::default());
+            }
+            let Some(host_id) = resolve_mutation_id(&host, aliases) else {
+                return Err(format!(
+                    "JavaScript Shadow DOM mutation skipped invalid host {host}"
+                ));
+            };
+            if document.append_shadow_child(host_id, child_node) {
+                aliases.insert(child, child_node_id);
+                Ok(DirtyState::all())
+            } else {
+                Err(format!(
+                    "JavaScript Shadow DOM mutation skipped missing host {host}"
+                ))
+            }
+        }
         DomMutation::Remove { id } => {
             let removed = created.remove(&id).is_some()
-                || parse_existing_id(&id)
+                || resolve_mutation_id(&id, aliases)
                     .and_then(|node_id| document.remove_node(node_id))
                     .is_some();
             if removed {
@@ -1186,7 +1265,7 @@ fn apply_dom_mutation(
                 }
                 return Err(format!("JavaScript DOM mutation skipped non-element {id}"));
             }
-            if parse_existing_id(&id)
+            if resolve_mutation_id(&id, aliases)
                 .is_some_and(|node_id| document.set_attribute(node_id, &name, value))
             {
                 Ok(dirty_for_attribute(&name))
@@ -1197,6 +1276,26 @@ fn apply_dom_mutation(
             }
         }
     }
+}
+
+fn read_custom_element_diagnostics(context: &mut Context) -> WebbyResult<Vec<String>> {
+    let value = context
+        .eval(Source::from_bytes(
+            CUSTOM_ELEMENT_DIAGNOSTIC_SNAPSHOT.as_bytes(),
+        ))
+        .map_err(|error| {
+            WebbyError::unsupported(format!(
+                "JavaScript custom element diagnostic read failed: {error}"
+            ))
+        })?;
+    let Some(json) = value.as_string() else {
+        return Ok(Vec::new());
+    };
+    serde_json::from_str::<Vec<String>>(&json.to_std_string_lossy()).map_err(|error| {
+        WebbyError::Parse {
+            message: format!("JavaScript custom element diagnostic JSON parse failed: {error}"),
+        }
+    })
 }
 
 fn dirty_for_attribute(name: &str) -> DirtyState {
@@ -1234,6 +1333,10 @@ fn take_next_id(next_id: &mut NodeId) -> NodeId {
 
 fn parse_existing_id(id: &str) -> Option<NodeId> {
     id.parse::<NodeId>().ok()
+}
+
+fn resolve_mutation_id(id: &str, aliases: &HashMap<String, NodeId>) -> Option<NodeId> {
+    aliases.get(id).copied().or_else(|| parse_existing_id(id))
 }
 
 fn read_console_log(context: &mut Context) -> WebbyResult<Vec<String>> {
@@ -1488,6 +1591,101 @@ mod tests {
             NodeKind::Element(element)
                 if element.attributes.get("name").map(String::as_str) == Some("q")
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn attach_shadow_renders_shadow_content_instead_of_light_dom() -> webby_core::WebbyResult<()> {
+        let mut document =
+            webby_html::parse_document("<body><x-card id=\"card\">Light fallback</x-card></body>")?;
+        let scripts = vec![ScriptSource::new(
+            "inline script 1",
+            "var root = document.getElementById('card').attachShadow({ mode: 'open' });\
+             var p = document.createElement('p');\
+             p.textContent = 'Shadow content';\
+             root.appendChild(p);",
+        )];
+
+        let report =
+            execute_scripts_with_dom(&mut document, &scripts, ExecutionOptions::default())?;
+
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(
+            webby_html::extract_visible_text(&document),
+            "Shadow content"
+        );
+        assert!(webby_html::dump_dom(&document).contains("#shadow-root"));
+        Ok(())
+    }
+
+    #[test]
+    fn custom_element_connected_callback_can_attach_shadow() -> webby_core::WebbyResult<()> {
+        let mut document = webby_html::parse_document("<body><x-card></x-card></body>")?;
+        let scripts = vec![ScriptSource::new(
+            "inline script 1",
+            "function Card() {}\
+             Card.prototype.connectedCallback = function() {\
+               var root = this.attachShadow({ mode: 'open' });\
+               var span = document.createElement('span');\
+               span.textContent = 'Upgraded';\
+               root.appendChild(span);\
+             };\
+             customElements.define('x-card', Card);",
+        )];
+
+        let report =
+            execute_scripts_with_dom(&mut document, &scripts, ExecutionOptions::default())?;
+
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(webby_html::extract_visible_text(&document), "Upgraded");
+        Ok(())
+    }
+
+    #[test]
+    fn unsupported_shadow_mode_is_diagnostic_not_panic() -> webby_core::WebbyResult<()> {
+        let mut document =
+            webby_html::parse_document("<body><x-card id=\"card\"></x-card></body>")?;
+        let scripts = vec![ScriptSource::new(
+            "inline script 1",
+            "document.getElementById('card').attachShadow({ mode: 'closed' });",
+        )];
+
+        let report =
+            execute_scripts_with_dom(&mut document, &scripts, ExecutionOptions::default())?;
+
+        assert!(report.diagnostics.iter().any(|diagnostic| {
+            diagnostic.contains("JavaScript Shadow DOM unsupported attachShadow mode")
+        }));
+        assert!(
+            report
+                .diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains("JavaScript error in inline script 1"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn moving_shadow_child_detaches_from_shadow_root() -> webby_core::WebbyResult<()> {
+        let mut document =
+            webby_html::parse_document("<body><x-card id=\"card\"></x-card></body>")?;
+        let scripts = vec![ScriptSource::new(
+            "inline script 1",
+            "var root = document.getElementById('card').attachShadow({ mode: 'open' });\
+             var p = document.createElement('p');\
+             p.textContent = 'Moved';\
+             root.appendChild(p);\
+             document.body.appendChild(p);",
+        )];
+
+        let report =
+            execute_scripts_with_dom(&mut document, &scripts, ExecutionOptions::default())?;
+
+        assert!(report.diagnostics.is_empty());
+        assert_eq!(webby_html::extract_visible_text(&document), "Moved");
+        let body = &document.root.children[0];
+        assert_eq!(body.children.len(), 2);
+        assert!(body.children[0].shadow_children.is_empty());
         Ok(())
     }
 

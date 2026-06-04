@@ -4,7 +4,10 @@
 //! unsupported selectors, and unsupported declarations are skipped with
 //! diagnostics so malformed CSS cannot stop page rendering.
 
-use webby_core::WebbyResult;
+use webby_core::{WebbyError, WebbyResult};
+
+/// Maximum CSS source bytes accepted by the parser.
+pub const MAX_STYLESHEET_BYTES: usize = 1024 * 1024;
 
 /// Parsed stylesheet with source-order-preserving rules.
 #[derive(Debug, Clone, PartialEq, Default)]
@@ -181,6 +184,8 @@ pub struct Declaration {
     pub property: Property,
     /// Parsed declaration value.
     pub value: Value,
+    /// Whether the declaration carries the `!important` priority.
+    pub important: bool,
 }
 
 /// Supported CSS properties.
@@ -210,6 +215,12 @@ pub enum Property {
     Display,
     /// `visibility`
     Visibility,
+    /// `overflow` shorthand.
+    Overflow,
+    /// `overflow-x`
+    OverflowX,
+    /// `overflow-y`
+    OverflowY,
     /// `margin`
     Margin,
     /// `padding`
@@ -283,6 +294,8 @@ pub enum Property {
 /// Parsed declaration value.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Value {
+    /// CSS-wide cascade keyword.
+    CssWideKeyword(CssWideKeyword),
     /// RGBA color.
     Color(Color),
     /// CSS pixel length.
@@ -307,6 +320,8 @@ pub enum Value {
     Display(Display),
     /// Visibility value.
     Visibility(Visibility),
+    /// Overflow behavior.
+    Overflow(Overflow),
     /// Border shorthand result.
     Border(BorderValue),
     /// Box sizing mode.
@@ -333,6 +348,30 @@ pub enum Value {
     TransitionTimingFunction(TransitionTimingFunction),
     /// Transition shorthand.
     Transition(TransitionValue),
+}
+
+/// CSS-wide keyword resolved by the computed-style layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CssWideKeyword {
+    /// Use the parent computed value.
+    Inherit,
+    /// Use the property's initial value.
+    Initial,
+    /// Inherit inherited properties and initialize other properties.
+    Unset,
+}
+
+/// CSS overflow behavior for one axis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Overflow {
+    /// Content may paint outside the box.
+    Visible,
+    /// Content is clipped without scrolling.
+    Hidden,
+    /// Content is clipped and scrollable.
+    Scroll,
+    /// Content is clipped and scrollable when needed.
+    Auto,
 }
 
 /// RGBA color.
@@ -584,6 +623,15 @@ pub struct BorderValue {
 
 /// Parses a stylesheet.
 pub fn parse_stylesheet(input: &str) -> WebbyResult<Stylesheet> {
+    if input.len() > MAX_STYLESHEET_BYTES {
+        return Err(WebbyError::Parse {
+            message: format!(
+                "CSS input is {} bytes, limit is {} bytes",
+                input.len(),
+                MAX_STYLESHEET_BYTES
+            ),
+        });
+    }
     let mut parser = StylesheetParser::new(input);
     Ok(parser.parse())
 }
@@ -1134,7 +1182,14 @@ fn parse_declaration_block(
 
 fn parse_declaration(property: &str, value: &str) -> Option<Declaration> {
     let normalized = property.trim().to_ascii_lowercase();
-    let trimmed_value = value.trim();
+    let (trimmed_value, important) = parse_important(value)?;
+    if let Some(keyword) = parse_css_wide_keyword(trimmed_value) {
+        return Some(Declaration {
+            property: parse_property_name(&normalized)?,
+            value: Value::CssWideKeyword(keyword),
+            important,
+        });
+    }
     let (property, value) = match normalized.as_str() {
         "color" => (Property::Color, Value::Color(parse_color(trimmed_value)?)),
         "background" => (
@@ -1180,6 +1235,18 @@ fn parse_declaration(property: &str, value: &str) -> Option<Declaration> {
         "visibility" => (
             Property::Visibility,
             Value::Visibility(parse_visibility(trimmed_value)?),
+        ),
+        "overflow" => (
+            Property::Overflow,
+            Value::Overflow(parse_overflow(trimmed_value)?),
+        ),
+        "overflow-x" => (
+            Property::OverflowX,
+            Value::Overflow(parse_overflow(trimmed_value)?),
+        ),
+        "overflow-y" => (
+            Property::OverflowY,
+            Value::Overflow(parse_overflow(trimmed_value)?),
         ),
         "margin" => (Property::Margin, Value::Edges(parse_edges(trimmed_value)?)),
         "padding" => (Property::Padding, Value::Edges(parse_edges(trimmed_value)?)),
@@ -1281,7 +1348,87 @@ fn parse_declaration(property: &str, value: &str) -> Option<Declaration> {
         _ => return None,
     };
 
-    Some(Declaration { property, value })
+    Some(Declaration {
+        property,
+        value,
+        important,
+    })
+}
+
+fn parse_important(value: &str) -> Option<(&str, bool)> {
+    let trimmed = value.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    let Some(index) = lower.rfind("!important") else {
+        return Some((trimmed, false));
+    };
+    if !lower[index + "!important".len()..].trim().is_empty() || lower[..index].contains('!') {
+        return None;
+    }
+    Some((trimmed[..index].trim_end(), true))
+}
+
+fn parse_css_wide_keyword(value: &str) -> Option<CssWideKeyword> {
+    match value.to_ascii_lowercase().as_str() {
+        "inherit" => Some(CssWideKeyword::Inherit),
+        "initial" => Some(CssWideKeyword::Initial),
+        "unset" => Some(CssWideKeyword::Unset),
+        _ => None,
+    }
+}
+
+fn parse_property_name(property: &str) -> Option<Property> {
+    match property {
+        "color" => Some(Property::Color),
+        "background" => Some(Property::Background),
+        "background-color" => Some(Property::BackgroundColor),
+        "font-size" => Some(Property::FontSize),
+        "font-family" => Some(Property::FontFamily),
+        "font-weight" => Some(Property::FontWeight),
+        "line-height" => Some(Property::LineHeight),
+        "text-align" => Some(Property::TextAlign),
+        "white-space" => Some(Property::WhiteSpace),
+        "text-decoration" => Some(Property::TextDecoration),
+        "display" => Some(Property::Display),
+        "visibility" => Some(Property::Visibility),
+        "overflow" => Some(Property::Overflow),
+        "overflow-x" => Some(Property::OverflowX),
+        "overflow-y" => Some(Property::OverflowY),
+        "margin" => Some(Property::Margin),
+        "padding" => Some(Property::Padding),
+        "border" => Some(Property::Border),
+        "border-width" => Some(Property::BorderWidth),
+        "border-color" => Some(Property::BorderColor),
+        "width" => Some(Property::Width),
+        "height" => Some(Property::Height),
+        "min-width" => Some(Property::MinWidth),
+        "max-width" => Some(Property::MaxWidth),
+        "min-height" => Some(Property::MinHeight),
+        "max-height" => Some(Property::MaxHeight),
+        "box-sizing" => Some(Property::BoxSizing),
+        "position" => Some(Property::Position),
+        "top" => Some(Property::Top),
+        "right" => Some(Property::Right),
+        "bottom" => Some(Property::Bottom),
+        "left" => Some(Property::Left),
+        "flex-direction" => Some(Property::FlexDirection),
+        "gap" => Some(Property::Gap),
+        "row-gap" => Some(Property::RowGap),
+        "column-gap" => Some(Property::ColumnGap),
+        "grid-template-columns" => Some(Property::GridTemplateColumns),
+        "grid-template-rows" => Some(Property::GridTemplateRows),
+        "grid-column" => Some(Property::GridColumn),
+        "grid-row" => Some(Property::GridRow),
+        "justify-content" => Some(Property::JustifyContent),
+        "align-items" => Some(Property::AlignItems),
+        "flex-grow" => Some(Property::FlexGrow),
+        "flex" => Some(Property::Flex),
+        "transition-property" => Some(Property::TransitionProperty),
+        "transition-duration" => Some(Property::TransitionDuration),
+        "transition-delay" => Some(Property::TransitionDelay),
+        "transition-timing-function" => Some(Property::TransitionTimingFunction),
+        "transition" => Some(Property::Transition),
+        _ => None,
+    }
 }
 
 fn parse_color(value: &str) -> Option<Color> {
@@ -1708,6 +1855,16 @@ fn parse_visibility(value: &str) -> Option<Visibility> {
     }
 }
 
+fn parse_overflow(value: &str) -> Option<Overflow> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "visible" => Some(Overflow::Visible),
+        "hidden" => Some(Overflow::Hidden),
+        "scroll" => Some(Overflow::Scroll),
+        "auto" => Some(Overflow::Auto),
+        _ => None,
+    }
+}
+
 fn valid_identifier(input: &str) -> bool {
     let mut chars = input.chars();
     let Some(first) = chars.next() else {
@@ -1730,11 +1887,11 @@ fn leading_whitespace_len(input: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::{
-        AlignItems, BoxSizing, Color, Combinator, Display, FlexDirection, FontFamily, FontWeight,
-        GridPlacement, GridTrack, JustifyContent, Length, LineHeight, MediaFeature, MediaType,
-        Orientation, Position, Property, PseudoClass, Selector, Size, TextAlign, TextDecoration,
-        TransitionProperty, TransitionTimingFunction, Value, Visibility, WhiteSpace,
-        parse_declarations, parse_stylesheet,
+        AlignItems, BoxSizing, Color, Combinator, CssWideKeyword, Display, FlexDirection,
+        FontFamily, FontWeight, GridPlacement, GridTrack, JustifyContent, Length, LineHeight,
+        MediaFeature, MediaType, Orientation, Overflow, Position, Property, PseudoClass, Selector,
+        Size, TextAlign, TextDecoration, TransitionProperty, TransitionTimingFunction, Value,
+        Visibility, WhiteSpace, opaque, parse_declarations, parse_stylesheet,
     };
 
     #[test]
@@ -1744,6 +1901,18 @@ mod tests {
         assert!(stylesheet.rules.is_empty());
         assert!(stylesheet.diagnostics.is_empty());
         Ok(())
+    }
+
+    #[test]
+    fn oversized_stylesheet_returns_structured_error() {
+        let css = "a".repeat(super::MAX_STYLESHEET_BYTES + 1);
+        let result = parse_stylesheet(&css);
+
+        assert!(matches!(
+            result,
+            Err(webby_core::WebbyError::Parse { message })
+                if message.contains("CSS input") && message.contains("limit")
+        ));
     }
 
     #[test]
@@ -2298,6 +2467,57 @@ mod tests {
 
         assert_eq!(declarations.len(), 2);
         assert_eq!(diagnostics.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn parses_css_wide_keywords_and_important_priority() -> webby_core::WebbyResult<()> {
+        let stylesheet =
+            parse_stylesheet("p { color: inherit !important; margin: initial; padding: unset; }")?;
+        let declarations = &stylesheet.rules[0].declarations;
+
+        assert_eq!(declarations.len(), 3);
+        assert_eq!(
+            declarations[0].value,
+            Value::CssWideKeyword(CssWideKeyword::Inherit)
+        );
+        assert!(declarations[0].important);
+        assert_eq!(
+            declarations[1].value,
+            Value::CssWideKeyword(CssWideKeyword::Initial)
+        );
+        assert_eq!(
+            declarations[2].value,
+            Value::CssWideKeyword(CssWideKeyword::Unset)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_important_priority_is_diagnostic_and_skipped() -> webby_core::WebbyResult<()> {
+        let stylesheet = parse_stylesheet("p { color: red !important trailing; color: blue; }")?;
+        let declarations = &stylesheet.rules[0].declarations;
+
+        assert_eq!(declarations.len(), 1);
+        assert_eq!(declarations[0].value, Value::Color(opaque(0, 0, 255)));
+        assert_eq!(stylesheet.diagnostics.len(), 1);
+        assert!(
+            stylesheet.diagnostics[0]
+                .message
+                .contains("unsupported or invalid declaration")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn parses_overflow_shorthand_and_axis_values() -> webby_core::WebbyResult<()> {
+        let stylesheet =
+            parse_stylesheet("div { overflow: hidden; overflow-x: scroll; overflow-y: auto; }")?;
+        let declarations = &stylesheet.rules[0].declarations;
+
+        assert_eq!(declarations[0].value, Value::Overflow(Overflow::Hidden));
+        assert_eq!(declarations[1].value, Value::Overflow(Overflow::Scroll));
+        assert_eq!(declarations[2].value, Value::Overflow(Overflow::Auto));
         Ok(())
     }
 

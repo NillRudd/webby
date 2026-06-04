@@ -1,6 +1,8 @@
 var __webby_nodes = {};
 var __webby_mutations = [];
 var __webby_event_handlers = [];
+var __webby_custom_element_registry = {};
+var __webby_custom_element_diagnostics = [];
 var __webby_next_temp_id = 1;
 
 function __webby_install(node, parent) {
@@ -8,6 +10,13 @@ function __webby_install(node, parent) {
   node.parent = parent;
   for (var index = 0; index < node.children.length; index = index + 1) {
     __webby_install(node.children[index], node.id);
+  }
+  if (!node.shadow_children) {
+    node.shadow_children = [];
+  }
+  node.has_shadow_root = node.shadow_children.length > 0;
+  for (var shadowIndex = 0; shadowIndex < node.shadow_children.length; shadowIndex = shadowIndex + 1) {
+    __webby_install(node.shadow_children[shadowIndex], "shadow:" + node.id);
   }
 }
 
@@ -95,6 +104,21 @@ function __webby_detach(id) {
   if (!node || node.parent === null) {
     return;
   }
+  if (String(node.parent).indexOf("shadow:") === 0) {
+    var host = __webby_nodes[String(node.parent).slice(7)];
+    if (!host) {
+      return;
+    }
+    var shadowKeptOnly = [];
+    for (var shadowOnlyIndex = 0; shadowOnlyIndex < host.shadow_children.length; shadowOnlyIndex = shadowOnlyIndex + 1) {
+      if (host.shadow_children[shadowOnlyIndex].id !== id) {
+        shadowKeptOnly.push(host.shadow_children[shadowOnlyIndex]);
+      }
+    }
+    host.shadow_children = shadowKeptOnly;
+    node.parent = null;
+    return;
+  }
   var parent = __webby_nodes[node.parent];
   if (!parent) {
     return;
@@ -106,6 +130,13 @@ function __webby_detach(id) {
     }
   }
   parent.children = kept;
+  var shadowKept = [];
+  for (var shadowIndex = 0; shadowIndex < parent.shadow_children.length; shadowIndex = shadowIndex + 1) {
+    if (parent.shadow_children[shadowIndex].id !== id) {
+      shadowKept.push(parent.shadow_children[shadowIndex]);
+    }
+  }
+  parent.shadow_children = shadowKept;
   node.parent = null;
 }
 
@@ -126,7 +157,87 @@ function __webby_append_child(parentId, childRef) {
     parent: parent.id,
     child: child.id
   });
+  __webby_upgrade_custom_element(childRef);
   return childRef;
+}
+
+function __webby_attach_shadow(hostId, options) {
+  var host = __webby_nodes[hostId];
+  if (!host || host.kind !== "element") {
+    throw new Error("missing shadow host " + hostId);
+  }
+  var mode = options && options.mode ? String(options.mode) : "";
+  if (mode !== "open") {
+    __webby_custom_element_diagnostics.push("JavaScript Shadow DOM unsupported attachShadow mode: " + mode);
+    throw new Error("only open shadow roots are supported");
+  }
+  host.shadow_children = [];
+  host.has_shadow_root = true;
+  __webby_mutations.push({ op: "attachShadow", host: hostId, mode: mode });
+  return __webby_shadow_ref(hostId);
+}
+
+function __webby_append_shadow_child(hostId, childRef) {
+  var host = __webby_nodes[hostId];
+  var child = childRef && __webby_nodes[childRef.__webbyId];
+  if (!host || host.kind !== "element") {
+    throw new Error("missing shadow host " + hostId);
+  }
+  if (!child) {
+    throw new Error("missing shadow child");
+  }
+  if (!host.shadow_children) {
+    host.shadow_children = [];
+  }
+  host.has_shadow_root = true;
+  __webby_detach(child.id);
+  child.parent = "shadow:" + host.id;
+  host.shadow_children.push(child);
+  __webby_mutations.push({
+    op: "appendShadowChild",
+    host: host.id,
+    child: child.id
+  });
+  __webby_upgrade_custom_element(childRef);
+  return childRef;
+}
+
+function __webby_shadow_ref(hostId) {
+  var root = { __webbyShadowHostId: hostId };
+  root.appendChild = function(child) {
+    return __webby_append_shadow_child(hostId, child);
+  };
+  root.querySelector = function(selector) {
+    return __webby_query_selector_from("shadow:" + hostId, selector, true);
+  };
+  root.querySelectorAll = function(selector) {
+    return __webby_query_selector_from("shadow:" + hostId, selector, false);
+  };
+  Object.defineProperty(root, "children", {
+    get: function() {
+      var host = __webby_nodes[hostId];
+      var output = [];
+      var children = host && host.shadow_children ? host.shadow_children : [];
+      for (var index = 0; index < children.length; index = index + 1) {
+        if (children[index].kind === "element") {
+          output.push(__webby_ref(children[index].id));
+        }
+      }
+      return output;
+    }
+  });
+  Object.defineProperty(root, "childNodes", {
+    get: function() {
+      var host = __webby_nodes[hostId];
+      var output = [];
+      var children = host && host.shadow_children ? host.shadow_children : [];
+      for (var index = 0; index < children.length; index = index + 1) {
+        output.push(__webby_ref(children[index].id));
+      }
+      return output;
+    }
+  });
+  return root;
 }
 
 function __webby_child_refs(node, elementsOnly) {
@@ -153,6 +264,12 @@ function __webby_sibling_ref(id, direction) {
     if (parent.children[index].id === id) {
       var sibling = parent.children[index + direction];
       return sibling ? __webby_ref(sibling.id) : null;
+    }
+  }
+  for (var shadowIndex = 0; shadowIndex < parent.shadow_children.length; shadowIndex = shadowIndex + 1) {
+    if (parent.shadow_children[shadowIndex].id === id) {
+      var shadowSibling = parent.shadow_children[shadowIndex + direction];
+      return shadowSibling ? __webby_ref(shadowSibling.id) : null;
     }
   }
   return null;
@@ -480,6 +597,9 @@ function __webby_ref(id) {
   ref.appendChild = function(child) {
     return __webby_append_child(id, child);
   };
+  ref.attachShadow = function(options) {
+    return __webby_attach_shadow(id, options);
+  };
   ref.remove = function() {
     __webby_remove(id);
   };
@@ -587,6 +707,12 @@ function __webby_ref(id) {
       return __webby_child_refs(__webby_nodes[id], false);
     }
   });
+  Object.defineProperty(ref, "shadowRoot", {
+    get: function() {
+      var node = __webby_nodes[id];
+      return node && node.has_shadow_root ? __webby_shadow_ref(id) : null;
+    }
+  });
   Object.defineProperty(ref, "parentNode", {
     get: function() {
       var node = __webby_nodes[id];
@@ -652,6 +778,14 @@ function __webby_walk(node, callback) {
     var found = __webby_walk(node.children[index], callback);
     if (found) {
       return found;
+    }
+  }
+  if (node.shadow_children) {
+    for (var shadowIndex = 0; shadowIndex < node.shadow_children.length; shadowIndex = shadowIndex + 1) {
+      var shadowFound = __webby_walk(node.shadow_children[shadowIndex], callback);
+      if (shadowFound) {
+        return shadowFound;
+      }
     }
   }
   return null;
@@ -844,7 +978,24 @@ function __webby_query_selector_from(rootId, selector, firstOnly) {
     parsedGroups.push(__webby_selector_steps(groups[groupIndex]));
   }
   var output = [];
-  var found = __webby_walk(__webby_nodes[rootId], function(node) {
+  var rootNode = null;
+  if (String(rootId).indexOf("shadow:") === 0) {
+    var hostId = String(rootId).slice(7);
+    var host = __webby_nodes[hostId];
+    rootNode = {
+      id: rootId,
+      kind: "document",
+      tag_name: "",
+      text: "",
+      attributes: {},
+      children: host && host.shadow_children ? host.shadow_children : [],
+      shadow_children: [],
+      parent: null
+    };
+  } else {
+    rootNode = __webby_nodes[rootId];
+  }
+  var found = __webby_walk(rootNode, function(node) {
     for (var groupIndex = 0; groupIndex < parsedGroups.length; groupIndex = groupIndex + 1) {
       var steps = parsedGroups[groupIndex];
       if (__webby_matches_complex_selector(node, steps, steps.length - 1)) {
@@ -887,6 +1038,8 @@ var document = {
       children: [],
       parent: null
     };
+    node.shadow_children = [];
+    node.has_shadow_root = false;
     __webby_nodes[id] = node;
     __webby_mutations.push({ op: "createElement", id: id, tag_name: node.tag_name });
     return __webby_ref(id);
@@ -902,11 +1055,61 @@ var document = {
       children: [],
       parent: null
     };
+    node.shadow_children = [];
+    node.has_shadow_root = false;
     __webby_nodes[id] = node;
     __webby_mutations.push({ op: "createTextNode", id: id, text: node.text });
     return __webby_ref(id);
   }
 };
+
+var customElements = {
+  define: function(name, constructor) {
+    var tagName = String(name).toLowerCase();
+    if (tagName.indexOf("-") < 0) {
+      __webby_custom_element_diagnostics.push("JavaScript customElements.define ignored invalid name: " + tagName);
+      return;
+    }
+    if (typeof constructor !== "function") {
+      __webby_custom_element_diagnostics.push("JavaScript customElements.define ignored non-function constructor: " + tagName);
+      return;
+    }
+    __webby_custom_element_registry[tagName] = constructor;
+    var existing = document.querySelectorAll(tagName);
+    for (var index = 0; index < existing.length; index = index + 1) {
+      __webby_upgrade_custom_element(existing[index]);
+    }
+  }
+};
+window.customElements = customElements;
+
+function __webby_upgrade_custom_element(ref) {
+  var node = ref && __webby_nodes[ref.__webbyId];
+  if (!node || node.kind !== "element" || node.__webby_upgraded) {
+    return;
+  }
+  var constructor = __webby_custom_element_registry[node.tag_name];
+  if (!constructor) {
+    return;
+  }
+  node.__webby_upgraded = true;
+  try {
+    constructor.call(ref);
+  } catch (error) {
+    try {
+      new constructor();
+    } catch (secondError) {
+      __webby_custom_element_diagnostics.push("JavaScript custom element constructor failed for " + node.tag_name + ": " + secondError);
+    }
+  }
+  if (constructor.prototype && typeof constructor.prototype.connectedCallback === "function") {
+    try {
+      constructor.prototype.connectedCallback.call(ref);
+    } catch (callbackError) {
+      __webby_custom_element_diagnostics.push("JavaScript custom element connectedCallback failed for " + node.tag_name + ": " + callbackError);
+    }
+  }
+}
 
 Object.defineProperty(document, "documentElement", {
   get: function() {

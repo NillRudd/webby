@@ -150,3 +150,39 @@ fn checked_in_demo_ppm_is_reproducible() -> TestResult {
     assert_eq!(expected_bytes, actual_bytes);
     Ok(())
 }
+
+#[test]
+fn release_demo_walkthrough_covers_public_feature_surface() -> TestResult {
+    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
+    let script = std::fs::read_to_string(root.join("scripts/demo.sh"))?;
+    for expected in [
+        "--resolve-input",
+        "static-blog",
+        "form-search",
+        "image-gallery",
+        "js-todo",
+        "--dump-diagnostics",
+        "--render-ppm",
+    ] {
+        assert!(
+            script.contains(expected),
+            "demo script should retain {expected}"
+        );
+    }
+
+    let docs = std::fs::read_to_string(root.join("docs/DEMO.md"))?;
+    for expected in [
+        "navigation",
+        "search resolution",
+        "GET form",
+        "decoded images",
+        "JavaScript",
+        "tabs",
+    ] {
+        assert!(
+            docs.contains(expected),
+            "demo docs should retain {expected}"
+        );
+    }
+    Ok(())
+}

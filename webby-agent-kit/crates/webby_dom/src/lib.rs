@@ -90,6 +90,32 @@ impl Document {
         true
     }
 
+    /// Ensures an element has a shadow root. Returns false if the host is
+    /// missing or cannot host children.
+    pub fn attach_shadow_root(&mut self, host_id: NodeId) -> bool {
+        let Some(host) = self.find_node_mut(host_id) else {
+            return false;
+        };
+        if matches!(host.kind, NodeKind::Text(_)) {
+            return false;
+        }
+        host.shadow_children.clear();
+        true
+    }
+
+    /// Appends `child` to an element's shadow root. Returns false if the host
+    /// is missing or cannot host children.
+    pub fn append_shadow_child(&mut self, host_id: NodeId, child: Node) -> bool {
+        let Some(host) = self.find_node_mut(host_id) else {
+            return false;
+        };
+        if matches!(host.kind, NodeKind::Text(_)) {
+            return false;
+        }
+        host.shadow_children.push(child);
+        true
+    }
+
     /// Removes a node by id and returns it. The document root cannot be
     /// removed.
     pub fn remove_node(&mut self, id: NodeId) -> Option<Node> {
@@ -109,6 +135,9 @@ pub struct Node {
     pub kind: NodeKind,
     /// Child nodes in source/tree order.
     pub children: Vec<Node>,
+    /// Shadow-root children in tree order. When present, these are the
+    /// render-facing children for Webby's scoped Shadow DOM subset.
+    pub shadow_children: Vec<Node>,
 }
 
 impl Node {
@@ -118,6 +147,7 @@ impl Node {
             id: 0,
             kind: NodeKind::Document,
             children: Vec::new(),
+            shadow_children: Vec::new(),
         }
     }
 
@@ -130,6 +160,7 @@ impl Node {
                 attributes,
             }),
             children: Vec::new(),
+            shadow_children: Vec::new(),
         }
     }
 
@@ -139,7 +170,24 @@ impl Node {
             id: 0,
             kind: NodeKind::Text(text.into()),
             children: Vec::new(),
+            shadow_children: Vec::new(),
         }
+    }
+
+    /// Children used by style/layout for Webby's composed tree. Shadow
+    /// children replace light children when a shadow root has content.
+    pub fn render_children(&self) -> &[Node] {
+        if self.shadow_children.is_empty() {
+            &self.children
+        } else {
+            &self.shadow_children
+        }
+    }
+
+    /// All structural children, including shadow-root children, for metadata
+    /// collection and mutation lookup.
+    pub fn tree_children(&self) -> impl Iterator<Item = &Node> {
+        self.children.iter().chain(self.shadow_children.iter())
     }
 }
 
@@ -169,11 +217,15 @@ fn assign_ids_from(node: &mut Node, next_id: &mut NodeId) {
     for child in &mut node.children {
         assign_ids_from(child, next_id);
     }
+    for child in &mut node.shadow_children {
+        assign_ids_from(child, next_id);
+    }
 }
 
 fn max_node_id(node: &Node) -> NodeId {
     node.children
         .iter()
+        .chain(node.shadow_children.iter())
         .map(max_node_id)
         .max()
         .map_or(node.id, |child_id| node.id.max(child_id))
@@ -183,7 +235,10 @@ fn find_node(node: &Node, id: NodeId) -> Option<&Node> {
     if node.id == id {
         return Some(node);
     }
-    node.children.iter().find_map(|child| find_node(child, id))
+    node.children
+        .iter()
+        .chain(node.shadow_children.iter())
+        .find_map(|child| find_node(child, id))
 }
 
 fn find_node_mut(node: &mut Node, id: NodeId) -> Option<&mut Node> {
@@ -191,6 +246,11 @@ fn find_node_mut(node: &mut Node, id: NodeId) -> Option<&mut Node> {
         return Some(node);
     }
     for child in &mut node.children {
+        if let Some(found) = find_node_mut(child, id) {
+            return Some(found);
+        }
+    }
+    for child in &mut node.shadow_children {
         if let Some(found) = find_node_mut(child, id) {
             return Some(found);
         }
@@ -203,6 +263,18 @@ fn remove_node(parent: &mut Node, id: NodeId) -> Option<Node> {
         return Some(parent.children.remove(index));
     }
     for child in &mut parent.children {
+        if let Some(removed) = remove_node(child, id) {
+            return Some(removed);
+        }
+    }
+    if let Some(index) = parent
+        .shadow_children
+        .iter()
+        .position(|child| child.id == id)
+    {
+        return Some(parent.shadow_children.remove(index));
+    }
+    for child in &mut parent.shadow_children {
         if let Some(removed) = remove_node(child, id) {
             return Some(removed);
         }
@@ -264,5 +336,26 @@ mod tests {
         assert_eq!(document.root.children[0].children[0].id, 2);
         assert!(document.remove_node(2).is_some());
         assert!(document.root.children[0].children.is_empty());
+    }
+
+    #[test]
+    fn shadow_children_are_assigned_and_found_deterministically() {
+        let mut document = Document::empty();
+        document
+            .root
+            .children
+            .push(Node::element("x-card", BTreeMap::new()));
+        document.assign_stable_ids();
+
+        assert!(document.attach_shadow_root(1));
+        assert!(document.append_shadow_child(1, Node::text("Shadow")));
+        document.assign_stable_ids();
+
+        let host = document.find_node(1);
+        assert!(host.is_some_and(|node| node.render_children().len() == 1));
+        assert!(matches!(
+            document.find_node(2).map(|node| &node.kind),
+            Some(NodeKind::Text(text)) if text == "Shadow"
+        ));
     }
 }

@@ -1,36 +1,61 @@
-# Webby Demo Script
+# Webby Demo
 
-The demo uses only checked-in fixtures and public CLI/app commands.
+## Deterministic Bundle
 
-## One Command
-
-From the repository root:
+Generate the local demo artifacts:
 
 ```bash
 scripts/demo.sh
 ```
 
-The script writes deterministic demo artifacts under `target/webby-demo/`.
-`docs/demo/color-block.ppm` is a small checked-in PPM reference generated from
-`tests/fixtures/render/color-block.html`.
+The script writes these files under `target/webby-demo/`:
 
-## Manual Steps
+- `search-resolution.txt`
+- `static-blog.dom.txt`
+- `static-blog.style.txt`
+- `form-search.layout.txt`
+- `layout-showcase.layout.txt`
+- `image-gallery.display-list.txt`
+- `js-todo.diagnostics.txt`
+- `external-diagnostics.txt`
+- `static-blog.ppm`
+- `image-gallery.ppm`
+- `native-shell-walkthrough.txt`
 
-```bash
-cargo test --workspace
-cargo run -p webby_cli -- --dump-dom tests/fixtures/sites/static-blog/index.html
-cargo run -p webby_cli -- --dump-style tests/fixtures/sites/static-blog/index.html
-cargo run -p webby_cli -- --dump-layout tests/fixtures/sites/layout-showcase/index.html --viewport-width 360
-cargo run -p webby_cli -- --dump-display-list tests/fixtures/sites/image-gallery/index.html --viewport-width 360
-cargo run -p webby_cli -- --render-ppm tests/fixtures/sites/static-blog/index.html --viewport-width 360 --output target/webby-demo/static-blog.ppm
-cargo run -p webby_cli -- --render-ppm tests/fixtures/sites/image-gallery/index.html --viewport-width 360 --output target/webby-demo/image-gallery.ppm
-```
+These artifacts exercise URL/search resolution, navigation-oriented DOM
+inspection, CSS styling, forms, inline and block layout, images, JavaScript
+diagnostics, external-resource diagnostics, display-list generation, and
+software rendering. They are deterministic local fixtures and do not require
+network access.
 
-Then run:
+## Native Shell
+
+Run:
 
 ```bash
 cargo run -p webby_app
 ```
 
-In a non-interactive environment, `webby_app` runs a headless startup smoke
-render and exits with a clear message.
+For an interactive walkthrough:
+
+1. Open `tests/fixtures/sites/static-blog/index.html` and follow the About and
+   Home links.
+2. Type `webby browser engine` into the address bar and press Enter to exercise
+   search resolution.
+3. Open `tests/fixtures/sites/form-search/index.html`, enter a query, and submit
+   the GET form.
+4. Open `tests/fixtures/sites/image-gallery/index.html` to see decoded images
+   and a missing-image fallback.
+5. Open `tests/fixtures/sites/js-todo/index.html` and use its button to exercise
+   the constrained JavaScript path.
+6. Use `Ctrl/Command+T` and `Ctrl/Command+Tab` to create and switch tabs.
+7. Use `F12` for debug overlay inspection and `F1` for shortcut help.
+
+In headless environments the native adapter exits cleanly. The deterministic
+CLI bundle remains available for CI and remote terminals.
+
+## References
+
+The checked-in render reference is [`demo/color-block.ppm`](demo/color-block.ppm).
+The final release snapshot is in
+[`FINAL_COMPATIBILITY_REPORT.md`](FINAL_COMPATIBILITY_REPORT.md).

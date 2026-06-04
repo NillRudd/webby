@@ -13,6 +13,9 @@ CLI paths. They are intentionally local and deterministic.
 - `images/` - image sizing and decode fixtures.
 - `navigation/` - linked local pages for URL and history behavior.
 - `sites/` - complete mini-sites that cross multiple pipeline stages.
+- `corpus/` - reduced synthetic pages modeled after common real-world website
+  patterns. This is the main compatibility gate.
+- `malformed/` - loader-backed broken-input recovery fixtures.
 - `regressions/` - preserved files for previously fixed bugs.
 - `expected/` - small deterministic expected-output snippets.
 
@@ -34,6 +37,21 @@ public APIs.
 - `sites/dynamic-fetch-storage/` - same-origin `fetch()` plus local/session
   storage updates through the app pipeline.
 
+## Reduced Compatibility Corpus
+
+The corpus pages are original synthetic fixtures, not copied website code:
+
+- `corpus/documentation/`
+- `corpus/news-article/`
+- `corpus/responsive-blog/`
+- `corpus/search-page/`
+- `corpus/dashboard/`
+- `corpus/ecommerce-grid/`
+- `corpus/login-form/`
+
+`expected/corpus-compatibility-report.txt` records deterministic render,
+interaction, diagnostic, unsupported-feature, and PPM-hash results.
+
 ## Regressions
 
 - `regressions/raw-text-lookalikes.html`
@@ -41,5 +59,11 @@ public APIs.
 - `regressions/external-diagnostics.html`
 - `regressions/image-decode-fallback.html`
 - `regressions/form-get.html`
+
+## Malformed Input Corpus
+
+`malformed/` keeps deterministic recovery cases for broken HTML, CSS,
+JavaScript, and linked resources. Tests render each fixture twice through the
+public loader-backed pipeline and compare diagnostics and display output.
 
 Expected-output policy lives in `expected/README.md`.

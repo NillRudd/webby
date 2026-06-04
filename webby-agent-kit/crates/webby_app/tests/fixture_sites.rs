@@ -337,6 +337,41 @@ fn regression_fixtures_do_not_panic_or_fail_pipeline() -> WebbyResult<()> {
 }
 
 #[test]
+fn malformed_fixture_corpus_recovers_deterministically() -> WebbyResult<()> {
+    let loader = DefaultResourceLoader::new()?;
+    let pipeline = PagePipeline::new(280, 180);
+    for (name, visible_text, expects_diagnostic) in [
+        ("html-recovery.html", "HTML recovery stays visible", false),
+        ("css-recovery.html", "CSS recovery stays visible", true),
+        (
+            "js-recovery.html",
+            "JavaScript recovery stays visible",
+            true,
+        ),
+        (
+            "network-boundaries.html",
+            "Linked resource recovery stays visible",
+            true,
+        ),
+    ] {
+        let url = file_url(&fixture_path(&["malformed", name]))?;
+        let first = pipeline.load_url(&loader, &url)?;
+        let second = pipeline.load_url(&loader, &url)?;
+
+        assert!(display_text(&first).contains(visible_text));
+        assert!(!first.display_list.commands.is_empty());
+        assert_eq!(first.diagnostics, second.diagnostics);
+        assert_eq!(first.display_list, second.display_list);
+        assert_eq!(
+            webby_layout::dump_layout_tree(&first.layout),
+            webby_layout::dump_layout_tree(&second.layout)
+        );
+        assert_eq!(expects_diagnostic, !first.diagnostics.is_empty());
+    }
+    Ok(())
+}
+
+#[test]
 fn fixture_navigation_tabs_and_cache_remain_app_level_behaviors() -> WebbyResult<()> {
     let loader = DefaultResourceLoader::new()?;
     let index = file_url(&fixture_path(&["sites", "static-blog", "index.html"]))?;
@@ -418,6 +453,148 @@ fn large_document_pipeline_stays_bounded_and_deterministic() -> WebbyResult<()> 
     );
     assert_eq!(first.display_list, second.display_list);
     Ok(())
+}
+
+#[test]
+fn reduced_real_world_corpus_matches_compatibility_report() -> WebbyResult<()> {
+    let first = corpus_compatibility_report()?;
+    let second = corpus_compatibility_report()?;
+    let expected_path = fixture_path(&["expected", "corpus-compatibility-report.txt"]);
+    let expected = std::fs::read_to_string(&expected_path).map_err(|source| WebbyError::Io {
+        path: Some(expected_path),
+        source,
+    })?;
+
+    assert_eq!(first, second);
+    assert_eq!(first, expected);
+    Ok(())
+}
+
+#[test]
+fn responsive_blog_corpus_fixture_applies_narrow_media_rule() -> WebbyResult<()> {
+    let page = load_fixture_page(&["corpus", "responsive-blog", "index.html"], 320, 220)?;
+
+    assert!(has_rgb_pixel(&page, [220, 252, 231]));
+    Ok(())
+}
+
+struct CorpusCase {
+    name: &'static str,
+    path: &'static str,
+    width: usize,
+    required_text: &'static [&'static str],
+    min_links: usize,
+    min_controls: usize,
+    unsupported: &'static str,
+}
+
+fn corpus_compatibility_report() -> WebbyResult<String> {
+    let mut report = String::from("# Webby reduced website corpus compatibility\n");
+    for case in corpus_cases() {
+        let page = load_fixture_page(&["corpus", case.path, "index.html"], case.width, 260)?;
+        let text = display_text(&page);
+        let render_passed = case
+            .required_text
+            .iter()
+            .filter(|required| text.contains(**required))
+            .count();
+        let interaction_checks =
+            usize::from(case.min_links > 0) + usize::from(case.min_controls > 0);
+        let interaction_passed =
+            usize::from(page.links.len() >= case.min_links && case.min_links > 0)
+                + usize::from(
+                    page.form_controls.len() >= case.min_controls && case.min_controls > 0,
+                );
+        report.push_str(&format!(
+            "{} render={}/{} interaction={}/{} diagnostics={} unsupported={} ppm_fnv1a64={:016x}\n",
+            case.name,
+            render_passed,
+            case.required_text.len(),
+            interaction_passed,
+            interaction_checks,
+            page.diagnostics.len(),
+            case.unsupported,
+            fnv1a64(&page.surface.to_ppm())
+        ));
+    }
+    Ok(report)
+}
+
+fn corpus_cases() -> [CorpusCase; 7] {
+    [
+        CorpusCase {
+            name: "documentation",
+            path: "documentation",
+            width: 440,
+            required_text: &["Acorn", "Install", "Examples"],
+            min_links: 2,
+            min_controls: 0,
+            unsupported: "none",
+        },
+        CorpusCase {
+            name: "news-article",
+            path: "news-article",
+            width: 440,
+            required_text: &["North Harbor Daily", "Community garden opens", "Related"],
+            min_links: 2,
+            min_controls: 0,
+            unsupported: "none",
+        },
+        CorpusCase {
+            name: "responsive-blog",
+            path: "responsive-blog",
+            width: 320,
+            required_text: &["Small Screen Notes", "Responsive by construction"],
+            min_links: 1,
+            min_controls: 0,
+            unsupported: "none",
+        },
+        CorpusCase {
+            name: "search-page",
+            path: "search-page",
+            width: 360,
+            required_text: &["Atlas Search", "Search pages"],
+            min_links: 0,
+            min_controls: 2,
+            unsupported: "none",
+        },
+        CorpusCase {
+            name: "dashboard",
+            path: "dashboard",
+            width: 440,
+            required_text: &["Signal Board", "Requests", "Healthy"],
+            min_links: 1,
+            min_controls: 0,
+            unsupported: "none",
+        },
+        CorpusCase {
+            name: "ecommerce-grid",
+            path: "ecommerce-grid",
+            width: 440,
+            required_text: &["Juniper Supply", "Field notebook", "Trail bottle"],
+            min_links: 1,
+            min_controls: 3,
+            unsupported: "missing-image-placeholder",
+        },
+        CorpusCase {
+            name: "login-form",
+            path: "login-form",
+            width: 360,
+            required_text: &["Lantern Account", "Email", "Password"],
+            min_links: 0,
+            min_controls: 3,
+            unsupported: "authentication-server",
+        },
+    ]
+}
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in bytes {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
 }
 
 fn encoded_test_image() -> WebbyResult<Vec<u8>> {

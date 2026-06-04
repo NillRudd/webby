@@ -34,10 +34,11 @@ fn run_non_interactive_smoke() -> WebbyResult<()> {
     let store = ProfileStore::default_user()?;
     let mut profile = store.load()?;
     let mut state = AppState::with_profile(&profile)?;
+    configure_disk_cache(&mut state, &store, &profile)?;
     state.submit_address(&loader);
     state.record_successful_navigation(&store, &mut profile)?;
     let _frame = state.compose_frame()?;
-    clear_cookies_on_exit_if_configured(&store, &mut profile)?;
+    clear_on_exit_if_configured(&store, &mut profile)?;
     println!("webby_app: non-interactive startup smoke rendered one frame");
     Ok(())
 }
@@ -47,6 +48,7 @@ fn run_window() -> WebbyResult<()> {
     let store = ProfileStore::default_user()?;
     let mut profile = store.load()?;
     let mut state = AppState::with_profile(&profile)?;
+    configure_disk_cache(&mut state, &store, &profile)?;
     state.submit_address(&loader);
     state.record_successful_navigation(&store, &mut profile)?;
 
@@ -59,7 +61,7 @@ fn run_window() -> WebbyResult<()> {
         Ok(window) => window,
         Err(error) => {
             eprintln!("webby_app: native window unavailable: {error}");
-            clear_cookies_on_exit_if_configured(&store, &mut profile)?;
+            clear_on_exit_if_configured(&store, &mut profile)?;
             return Ok(());
         }
     };
@@ -83,14 +85,28 @@ fn run_window() -> WebbyResult<()> {
         update_window_frame(&state, &mut window)?;
     }
 
-    clear_cookies_on_exit_if_configured(&store, &mut profile)?;
+    clear_on_exit_if_configured(&store, &mut profile)?;
     Ok(())
 }
 
-fn clear_cookies_on_exit_if_configured(
+fn configure_disk_cache(
+    state: &mut AppState,
+    store: &ProfileStore,
+    profile: &webby_state::BrowserProfile,
+) -> WebbyResult<()> {
+    if profile.config.disk_cache_enabled {
+        state.enable_disk_cache(store.cache_dir())?;
+    }
+    Ok(())
+}
+
+fn clear_on_exit_if_configured(
     store: &ProfileStore,
     profile: &mut webby_state::BrowserProfile,
 ) -> WebbyResult<()> {
+    if profile.config.clear_data_on_exit {
+        return store.clear_browsing_data(profile);
+    }
     if profile.config.clear_cookies_on_exit {
         store.clear_cookies(profile)?;
     }
@@ -108,11 +124,24 @@ fn handle_keyboard(
         if handle_tab_keyboard_command(state, key, window) {
             continue;
         }
+        if handle_ux_keyboard_command(state, key, window) {
+            continue;
+        }
         match key {
+            Key::F1 => state.toggle_shortcut_help(),
             Key::F12 => state.toggle_debug_overlay(),
+            Key::Tab => {
+                if window.is_key_down(Key::LeftShift) || window.is_key_down(Key::RightShift) {
+                    state.focus_previous_page_item();
+                } else {
+                    state.focus_next_page_item();
+                }
+            }
             Key::Enter => {
-                if state.focused_form_control.is_some() {
-                    if state.submit_focused_form(loader) {
+                if state.find_active {
+                    state.close_find();
+                } else if !state.chrome.address_focused && state.keyboard_focus.is_some() {
+                    if state.activate_keyboard_focus(loader) {
                         state.record_successful_navigation(store, profile)?;
                     }
                 } else {
@@ -141,7 +170,21 @@ fn handle_keyboard(
                 }
             }
             Key::Backspace => state.backspace(),
-            Key::Space => state.type_character(' '),
+            Key::Left => state.move_address_cursor_left(),
+            Key::Right => state.move_address_cursor_right(),
+            Key::Home => state.move_address_cursor_home(),
+            Key::End => state.move_address_cursor_end(),
+            Key::Space => {
+                if !state.chrome.address_focused && state.press_space_on_keyboard_focus(loader) {
+                    state.record_successful_navigation(store, profile)?;
+                } else {
+                    state.type_character(' ');
+                }
+            }
+            Key::Up => state.keyboard_scroll_by(-48.0),
+            Key::Down => state.keyboard_scroll_by(48.0),
+            Key::PageUp => state.keyboard_scroll_by(-(state.page_viewport_height() as f32)),
+            Key::PageDown => state.keyboard_scroll_by(state.page_viewport_height() as f32),
             key => {
                 if let Some(character) = key_to_address_char(key, window) {
                     state.type_character(character);
@@ -150,6 +193,29 @@ fn handle_keyboard(
         }
     }
     Ok(())
+}
+
+fn handle_ux_keyboard_command(state: &mut AppState, key: Key, window: &Window) -> bool {
+    if !has_command_modifier(window) {
+        return false;
+    }
+    match key {
+        Key::A => {
+            state.select_all_address();
+            true
+        }
+        Key::C => state.copy_address_or_current_url(),
+        Key::V => state.paste_address(),
+        Key::F => {
+            state.open_find();
+            true
+        }
+        Key::L | Key::O => {
+            state.select_all_address();
+            true
+        }
+        _ => false,
+    }
 }
 
 fn handle_tab_keyboard_command(state: &mut AppState, key: Key, window: &Window) -> bool {
@@ -244,7 +310,12 @@ fn handle_scroll(state: &mut AppState, window: &Window) {
     let Some((_, wheel_y)) = window.get_scroll_wheel() else {
         return;
     };
-    state.scroll_by(-wheel_y * 48.0);
+    let delta_y = -wheel_y * 48.0;
+    if let Some((x, y)) = window.get_mouse_pos(MouseMode::Discard) {
+        state.scroll_at_window_position(x, y, delta_y);
+    } else {
+        state.scroll_by(delta_y);
+    }
 }
 
 fn handle_hover(state: &mut AppState, window: &Window) {
@@ -348,6 +419,7 @@ fn surface_to_argb(surface: &webby_render::Surface) -> WebbyResult<Vec<u32>> {
 fn update_window_frame(state: &AppState, window: &mut Window) -> WebbyResult<()> {
     let frame = state.compose_frame()?;
     let buffer = surface_to_argb(&frame)?;
+    window.set_title(&format!("{} - Webby", state.window_title()));
     window
         .update_with_buffer(&buffer, frame.width, frame.height)
         .map_err(|error| WebbyError::Render {
@@ -357,8 +429,9 @@ fn update_window_frame(state: &AppState, window: &mut Window) -> WebbyResult<()>
 
 #[cfg(test)]
 mod tests {
-    use super::{TabCommand, apply_tab_command};
+    use super::{TabCommand, apply_tab_command, clear_on_exit_if_configured};
     use webby_app::AppState;
+    use webby_core::{WebbyError, WebbyResult};
 
     #[test]
     fn native_adapter_tab_commands_delegate_to_app_state() {
@@ -376,5 +449,46 @@ mod tests {
 
         assert!(apply_tab_command(&mut state, TabCommand::Close));
         assert_eq!(state.tab_count(), 1);
+    }
+
+    #[test]
+    fn native_adapter_clear_data_on_exit_uses_profile_store() -> WebbyResult<()> {
+        let root =
+            std::env::temp_dir().join(format!("webby-app-clear-exit-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        let store = webby_state::ProfileStore::new(&root);
+        let url = url::Url::parse("https://example.test/").map_err(|error| WebbyError::Url {
+            message: error.to_string(),
+        })?;
+        let mut profile = webby_state::BrowserProfile {
+            config: webby_state::BrowserConfig {
+                clear_data_on_exit: true,
+                persist_cookies: true,
+                ..webby_state::BrowserConfig::default()
+            },
+            ..webby_state::BrowserProfile::default()
+        };
+        store.record_successful_navigation(&mut profile, &url)?;
+        store.add_bookmark(&mut profile, &url)?;
+        profile.cookies.store_from_headers(
+            &url,
+            &[(
+                "set-cookie".to_string(),
+                "sid=abc; Path=/; Max-Age=60".to_string(),
+            )],
+        );
+        profile
+            .local_storage
+            .set_item("https://example.test:443", "theme", "dark")?;
+        store.save(&profile)?;
+
+        clear_on_exit_if_configured(&store, &mut profile)?;
+        let loaded = store.load()?;
+
+        assert!(loaded.history.entries.is_empty());
+        assert!(loaded.bookmarks.bookmarks.is_empty());
+        assert!(loaded.cookies.cookies.is_empty());
+        assert!(loaded.local_storage.origins.is_empty());
+        Ok(())
     }
 }

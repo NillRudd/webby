@@ -1,0 +1,53 @@
+#document
+  "\n"
+  <html>
+    "\n  "
+    <head>
+      <title>
+        "Webby & recovery <b>literal"
+    "\n  "
+    <body>
+      "\n    "
+      <p>
+        "First "
+        <em>
+          "inline"
+      <div>
+        "Block"
+      "\n    "
+      <ul>
+        <li>
+          "One"
+        <li>
+          "Two"
+      "\n    "
+      <table>
+        "\n      "
+        <thead>
+          <tr>
+            <th>
+              "A"
+            <th>
+              "B\n      "
+        <tbody>
+          <tr>
+            <td>
+              "1"
+            <td>
+              "2"
+          <tr>
+            <td>
+              "3"
+            <td>
+              "4\n    "
+      "\n    "
+      <textarea>
+        "keep & <b>literal"
+      "\n    "
+      <svg>
+        <foreignobject>
+          <p>
+            "Fallback"
+      "\n  "
+    "\n"
+  "\n"

@@ -1,0 +1,8 @@
+body { margin: 8px; background-color: #f0fdf4; color: #14532d; }
+main { display: flex; gap: 8px; }
+article { padding: 8px; border: 1px solid #16a34a; }
+aside { padding: 6px; }
+@media screen and (max-width: 360px) {
+  body { background-color: #dcfce7; }
+  main { display: block; }
+}

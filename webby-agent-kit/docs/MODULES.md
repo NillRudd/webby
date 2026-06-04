@@ -51,11 +51,24 @@ Responsibilities:
 
 - `http`, `https`, `file`, and `data` loading
 - optional request headers through `ResourceLoader::load_with_headers`
+- HTTP Basic `Authorization` header helpers and Basic challenge parsing; header
+  diagnostics must be redacted by app/CLI callers
 - URL-encoded form submission through `ResourceLoader::submit_form_urlencoded`
 - response metadata such as requested URL, final URL, status, content type,
   response headers, and bytes
+- bounded response bodies with a documented default 8 MiB limit
+- deterministic redirect policy with a 10-hop maximum and loop detection
+- 15 second default network timeout
+- gzip response decoding through `reqwest`; brotli/deflate are not enabled yet
 - small deterministic content-type sniffing for common image and HTML bytes
-- UTF-8 text decoding helper
+- text decoding helpers that prefer HTTP charset, then HTML `<meta charset>`,
+  with UTF-8 replacement fallback and Latin-1-compatible decoding for
+  `iso-8859-1`/`latin1`/`windows-1252`
+- network diagnostic summaries with requested URL, final URL, status, content
+  type, and byte count
+- top-level response classification for HTML rendering versus download, using
+  `Content-Disposition: attachment`, supported HTML media types, and
+  deterministic unsupported-media fallback metadata
 
 Must not parse HTML, style documents, layout boxes, draw pixels, or own browser
 navigation.
@@ -87,7 +100,7 @@ Current behavior:
 
 ## `webby_cache`
 
-Owns Webby's in-memory resource byte cache.
+Owns Webby's memory-first resource byte cache and optional persistent disk tier.
 
 Policy:
 
@@ -106,9 +119,18 @@ Policy:
 - downstream image decode failures still leave the successfully loaded bytes in
   the byte cache; rendering keeps using deterministic image placeholders when
   decode fails
+- the optional disk tier stores deterministic `index.json` metadata plus
+  numbered body files under the profile `cache/` directory
+- disk entries preserve requested URL key, final URL, response metadata, byte
+  length, and monotonic stored/access sequences
+- corrupt disk indexes are cleared safely; corrupt body entries are discarded
+  and reloaded through `webby_net`
+- `BrowserConfig.disk_cache_enabled` controls native-app disk-tier startup
+- `webby_cli --clear-cache [--profile-dir <path>]` removes persisted entries
+  without changing profile state
 
 Diagnostics are deterministic strings for hit, miss, store, refresh,
-load-failed, skip-store, and evict events.
+load-failed, skip-store, evict, and disk-tier equivalents.
 
 ## `webby_dom`
 
@@ -126,6 +148,7 @@ Requirements:
 - stable traversal order
 - normalized HTML tag names
 - deterministic attribute storage
+- host-owned `shadow_children` for Webby's scoped open Shadow DOM subset
 - no rendering or networking logic
 
 ## `webby_html`
@@ -139,24 +162,41 @@ Current scope:
 - quoted and unquoted attributes
 - text nodes
 - comments and ignored doctypes
-- void elements: `br`, `img`, `meta`, `link`, `input`
+- standard void elements including `br`, `img`, `meta`, `link`, and `input`
 - form attributes: `form action/method`, `input type/name/value/placeholder`,
   `input checked/disabled`, `button type/name/value`, `label for`,
   `select/option value/selected/disabled`, and `textarea placeholder`
 - iframe attributes: `src`, `width`, `height`, `name`, and `sandbox`
 - raw text handling for `script` and `style`
+- escapable raw text handling for `title` and `textarea`
+- forgiving optional end-tag recovery for paragraphs, list items, and common
+  table sections/rows/cells
+- generic DOM fallback for foreign content such as SVG
 - stylesheet link extraction
 - favicon/icon link extraction
 - preload/preconnect resource-hint extraction for deterministic no-op
   diagnostics
 - inline script extraction in document order
 - visible text extraction that ignores `head`, `script`, and `style`
+- hard limits of 4 MiB HTML input and 16,384 produced DOM nodes, with
+  structured parse errors when exceeded
 
-Malformed HTML should not panic or infinite-loop.
+Malformed HTML should not panic or infinite-loop. `parse_document` is the quiet
+compatibility API. `parse_document_with_diagnostics` also returns deterministic
+recovery diagnostics with best-effort byte offsets.
 
 ## `webby_css`
 
 Parses Webby's small CSS subset.
+
+The parser retains declaration importance and CSS-wide `inherit`, `initial`,
+and `unset` keywords for `webby_style` to resolve during computed-style
+construction. Invalid declarations are forgiving diagnostics rather than page
+failures. Stylesheet sources above 1 MiB return structured parse errors; linked
+stylesheet callers surface those as non-fatal diagnostics.
+
+The parsed property subset includes `overflow`, `overflow-x`, and `overflow-y`
+with `visible`, `hidden`, `scroll`, and `auto` values.
 
 Selectors:
 
@@ -302,6 +342,8 @@ Responsibilities:
   imports
 - detect module cycles without looping
 - return ordered `webby_js::ScriptSource` values plus non-fatal diagnostics
+- skip inline and external script sources above 256 KiB before execution,
+  emitting deterministic diagnostics
 
 It does not execute JavaScript, own DOM mutation, style, layout, or rendering.
 
@@ -326,10 +368,14 @@ Current scope:
   `querySelectorAll`, `documentElement`, `body`, `title`, `createElement`, and
   `createTextNode`
 - element/node API: `textContent`, `innerText`, `appendChild`, `remove`,
-  `setAttribute`, `getAttribute`, `className`, `classList`, `dataset`,
+  `attachShadow({ mode: "open" })`, `shadowRoot`, `setAttribute`,
+  `getAttribute`, `className`, `classList`, `dataset`,
   inline `style`, `children`, `childNodes`, sibling/parent/first/last accessors,
   `matches`, `closest`, `getBoundingClientRect`, `clientWidth`,
   `clientHeight`, `scrollWidth`, `scrollHeight`, and `id`
+- custom elements v0.1: `customElements.define(name, constructor)` for
+  autonomous custom-element names with `-`, constructor attempts, and
+  `connectedCallback` when an element is upgraded or appended
 - small DOM event API: `addEventListener` for `click`, `input`, and `submit`,
   plus `onclick`, bubbling, `preventDefault`, and deterministic handler
   diagnostics
@@ -376,9 +422,17 @@ snapshot. Initial page-load scripts receive viewport values before layout is
 computed; event/timer callbacks in `webby_app` receive geometry from the current
 rendered page.
 
+Shadow DOM support is intentionally scoped. Only open shadow roots are
+accepted. Shadow children replace light DOM children in Webby's composed
+style/layout/render tree, while unsupported modes produce deterministic
+diagnostics. Shadow-root selector APIs and document selectors use Webby's
+supported selector subset; broad encapsulation, slots, adopted stylesheets, and
+cross-root event semantics are not implemented yet.
+
 Selector forms outside Webby's supported CSS subset, keyboard events beyond the
 current app bridge, dynamic fetch URL expressions, real Promises, intervals,
-import maps, module import bindings, and broad network APIs are not
+import maps, module import bindings, unsupported custom-element lifecycle
+callbacks, and broad network APIs are not
 implemented yet. Timer callbacks are deterministic and test-driven; Webby does
 not run a real wall-clock JavaScript event loop. This crate does not fetch
 resources, compute style/layout, or render pixels. DOM mutation operations are
@@ -394,7 +448,7 @@ Requirements:
 - computed display, color, background, font size, font family, line height,
   font weight, text decoration, text alignment, white-space, visibility,
   margin, padding, border, width/height, min/max sizing, box sizing, and
-  flex/grid values
+  flex/grid values and axis-specific overflow intent
 - default styles for document, text, common semantic block elements, lists,
   links, images, and form controls
 - hidden metadata/script/style content excluded from the style tree
@@ -442,6 +496,7 @@ Responsibilities:
 - report direct URL/decode errors as structured errors
 - skip failed page-image loads/decodes in bulk loading so placeholders can be
   used downstream
+- reject decoded images above 16,000,000 pixels before retaining RGBA buffers
 
 Uses the `image` crate with default features disabled and PNG/JPEG enabled.
 
@@ -474,6 +529,8 @@ Current behavior:
 - `visibility:hidden` preserves geometry but suppresses link/form hit regions
   and paint-facing image visibility
 - scroll height
+- layout-owned overflow clip and scroll-container metadata with stable DOM ids
+- clipped link/form hit-region projection under nested app-owned offsets
 - image sizing precedence: CSS size, HTML attributes, decoded intrinsic size,
   then placeholder defaults
 - block width/height resolution for content-box and border-box sizing
@@ -514,14 +571,19 @@ Converts layout output into display commands and pixels.
 Responsibilities:
 
 - display list construction
+- backend-neutral display commands
+- `RenderBackend` plus the deterministic `SoftwareRenderBackend`
 - deterministic display-list dumps
 - rectangles, borders, lines, circles, text, form controls, SVG/canvas drawing
   commands, and image pixel blitting
 - safe clipping
+- scoped overflow clip commands consumed from layout metadata
 - PPM output
 
 Renderer consumes layout/display-list data. It does not parse HTML, fetch
 resources, decode images, own navigation, or own interaction state.
+The software backend remains the default and only implemented backend; it is
+kept deterministic for tests, CLI snapshots, and the native app.
 
 ## `webby_app`
 
@@ -536,17 +598,27 @@ Owns:
 - clickable tab strip and browser chrome controls
 - navigation state
 - link hit testing
+- keyboard focus traversal and activation for page links and controls
+- accessibility metadata derived from existing page/layout/form metadata
 - hover target feedback for chrome, links, and form controls
 - scroll state
+- per-tab nested scroll-container offsets, with pointer wheel input routed to
+  the deepest visible scroll container before falling back to page scrolling
 - form focus/editing/submission state
 - profile composition for homepage, bookmarks, recent pages, and persistent
   successful history
 - shared resource cache for page, stylesheet, and image loads
+- advisory performance diagnostics for documents above 1,000 DOM nodes
 - iframe browsing contexts coordinated through the normal loader-backed page
   pipeline
 - session cookie jar and cookie privacy config
 - deterministic animation clock and transition enable/disable state
-- loading and error states
+- explicit navigation lifecycle state for resolving, main-resource loading,
+  subresource/script pipeline work, rendering, completion, failure, and
+  cancellation
+- generation-token checks so late navigation results or stale timers cannot
+  mutate a replaced page
+- loading, cancelled, and error diagnostics
 
 Tabs:
 
@@ -594,13 +666,44 @@ Startup:
 
 Native shortcuts:
 
+- `Tab` / `Shift+Tab`: move deterministic page focus through visible links and
+  enabled form controls
+- `Enter`: activate the focused page link/button or submit the focused editable
+  form control
+- `Space`: toggle focused checkboxes/radios or activate focused buttons; in
+  editable text controls it remains text input
+- Up/Down/PageUp/PageDown: keyboard page scrolling
 - `Ctrl`/`Command` + `T`: new tab
 - `Ctrl`/`Command` + `W`: close active tab
 - `Ctrl`/`Command` + `Tab`: next tab
 - `Ctrl`/`Command` + `Shift` + `Tab`: previous tab
 - `Alt`/`Ctrl`/`Command` + Left/Right: back/forward
 - `Ctrl`/`Command` + `R`: reload
+- `Ctrl`/`Command` + `L`: focus/select the address field
+- `Ctrl`/`Command` + `A`: select the complete address field
+- `Ctrl`/`Command` + `C` / `V`: copy and paste through Webby's deterministic
+  app-local clipboard
+- `Ctrl`/`Command` + `F`: open find-in-page
+- `Ctrl`/`Command` + `O`: focus the address field for a local file path
+- Left/Right/Home/End: move the address insertion cursor when it is focused
+- `F1`: shortcut-help panel
 - `F12`: debug overlay
+
+Browser UX state stays in `webby_app`: page titles and favicon metadata are
+shown in chrome, hovered links appear in the bottom status bar, errors/loading
+states render readable pages, find-in-page counts visible text matches, local
+paths open through normal URL navigation, and explicit resource downloads are
+written through a shell-managed API. Navigation-triggered downloads use a
+configurable shell directory, sanitized filenames, deterministic `-2`, `-3`
+collision suffixes, and completion diagnostics. A completed download preserves
+the previously committed page URL and history entry. The clipboard is
+intentionally app-local;
+platform clipboard and file-dialog integration remain future adapter work.
+
+HTTP Basic authentication is shell-coordinated. `webby_app` keeps credentials in
+memory only, keyed by Webby's origin model, records redacted challenge state,
+and refreshes authenticated navigations past cached 401 responses. Failed or
+missing credentials become visible app error states and do not commit history.
 
 Form support covers GET query submissions and URL-encoded POST submissions.
 Unsupported methods become deterministic app errors.
@@ -608,6 +711,11 @@ Controls outside a containing form can focus but do not implicitly submit.
 Checkboxes, radio groups, selects, text/password/email/search inputs,
 textareas, submit buttons, reset buttons, and inert `button` controls are
 handled by app state; layout/render only expose geometry and drawing data.
+
+Accessibility v0.1 exposes inspectable roles for links, buttons, textboxes,
+checkboxes, and radios. Names come from link/control text, associated labels,
+`aria-label`, placeholder/value fallback, and image alt text where available.
+This metadata is debug/test oriented and is not a platform accessibility API.
 
 Debug tools:
 
@@ -628,6 +736,8 @@ Commands:
 ```bash
 webby_cli --resolve-input "example.com"
 webby_cli --fetch "https://example.com"
+webby_cli --fetch "https://example.com/private" --basic-auth user:password
+webby_cli --download "https://example.com/archive.zip" --output archive.zip
 webby_cli --dump-dom examples/simple.html
 webby_cli --dump-text examples/simple.html
 webby_cli --dump-css examples/debug.html
@@ -642,11 +752,18 @@ webby_cli --list-bookmarks
 webby_cli --add-bookmark https://example.com/
 webby_cli --remove-bookmark https://example.com/
 webby_cli --clear-cookies
+webby_cli --clear-history
+webby_cli --clear-bookmarks
+webby_cli --clear-local-storage
+webby_cli --clear-cache
+webby_cli --clear-browsing-data
+webby_cli --profile-summary
 ```
 
 CLI commands compose crate APIs. They do not own core algorithms. Stylesheet
 and cache diagnostics are surfaced deterministically; PPM output remains
-binary-clean.
+binary-clean and is generated through Webby's deterministic software render
+backend.
 
 ## `webby_state`
 
@@ -681,9 +798,11 @@ Default config:
   "cookies_enabled": true,
   "persist_cookies": false,
   "clear_cookies_on_exit": false,
+  "clear_data_on_exit": false,
   "javascript_enabled": true,
   "storage_enabled": true,
-  "animations_enabled": true
+  "animations_enabled": true,
+  "disk_cache_enabled": true
 }
 ```
 
@@ -706,6 +825,11 @@ Cookie behavior:
 - disabling persistence removes any stale `cookies.json` on save.
 - `--clear-cookies` clears in-memory profile cookies and removes
   `cookies.json`.
+- `clear_cookies_on_exit` performs the same cookie clear when the native app
+  exits.
+- `clear_data_on_exit` clears history, recent pages, bookmarks, cookies,
+  localStorage, and the profile disk cache when the native app exits. It takes
+  precedence over cookie-only exit clearing.
 - invalid `Set-Cookie` diagnostics are redacted and do not include raw cookie
   names or values.
 
@@ -720,4 +844,9 @@ Web Storage behavior:
   `webby_state::STORAGE_QUOTA_BYTES` bytes, counted as UTF-8 key plus value
   bytes.
 - `sessionStorage` is non-persistent and isolated per tab.
+- `webby_app::AppState::clear_session_storage` clears all open tab
+  `sessionStorage` values without closing or corrupting active tabs.
+- `--clear-local-storage` removes `local_storage.json`; `--clear-browsing-data`
+  removes localStorage together with history, recent pages, bookmarks, cookies,
+  and cache data.
 - corrupt `local_storage.json` returns a structured parse error.

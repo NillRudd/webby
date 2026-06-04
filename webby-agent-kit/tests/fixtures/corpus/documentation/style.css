@@ -1,0 +1,6 @@
+body { margin: 8px; color: #172554; background-color: #f8fafc; }
+.docs { display: flex; gap: 10px; }
+nav { width: 110px; padding: 6px; background-color: #dbeafe; }
+nav a { display: block; margin: 4px; }
+article { padding: 8px; border: 1px solid #93c5fd; }
+pre { background-color: #eff6ff; padding: 4px; }

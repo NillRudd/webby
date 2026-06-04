@@ -1,0 +1,8 @@
+# Webby reduced website corpus compatibility
+documentation render=3/3 interaction=1/1 diagnostics=0 unsupported=none ppm_fnv1a64=44fac3d40ad47d57
+news-article render=3/3 interaction=1/1 diagnostics=0 unsupported=none ppm_fnv1a64=792d2d3bb6ec9dc8
+responsive-blog render=2/2 interaction=1/1 diagnostics=0 unsupported=none ppm_fnv1a64=e01b3b1244ccfb6f
+search-page render=2/2 interaction=1/1 diagnostics=0 unsupported=none ppm_fnv1a64=419d4cab1fb7148e
+dashboard render=3/3 interaction=1/1 diagnostics=0 unsupported=none ppm_fnv1a64=85c5ae5018f8a013
+ecommerce-grid render=3/3 interaction=2/2 diagnostics=0 unsupported=missing-image-placeholder ppm_fnv1a64=d48ee702737ccc07
+login-form render=3/3 interaction=1/1 diagnostics=0 unsupported=authentication-server ppm_fnv1a64=0302bf1a6196be47

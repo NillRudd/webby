@@ -553,4 +553,32 @@ mod tests {
         );
         Ok(())
     }
+
+    #[test]
+    fn generated_boundary_inputs_resolve_deterministically_without_panicking() {
+        let fragments = [
+            "",
+            " ",
+            ":",
+            "://",
+            "http://",
+            "https://[",
+            "file:",
+            "file://host/path",
+            "[::1",
+            "localhost:",
+            "example..test",
+            "word word",
+            "räksmörgås",
+            "\0",
+        ];
+
+        for repeat in 1..=fragments.len() {
+            let input = fragments[..repeat].join("/");
+            let first = resolve_input(&input, &SearchEngine::default());
+            let second = resolve_input(&input, &SearchEngine::default());
+
+            assert_eq!(format!("{first:?}"), format!("{second:?}"));
+        }
+    }
 }

@@ -31,6 +31,34 @@ name = "dynamic-fetch-storage"
 start_url = "sites/dynamic-fetch-storage/index.html"
 expected_text = "Fetched fixture data / session ok"
 
+[[corpus]]
+name = "documentation"
+start_url = "corpus/documentation/index.html"
+
+[[corpus]]
+name = "news-article"
+start_url = "corpus/news-article/index.html"
+
+[[corpus]]
+name = "responsive-blog"
+start_url = "corpus/responsive-blog/index.html"
+
+[[corpus]]
+name = "search-page"
+start_url = "corpus/search-page/index.html"
+
+[[corpus]]
+name = "dashboard"
+start_url = "corpus/dashboard/index.html"
+
+[[corpus]]
+name = "ecommerce-grid"
+start_url = "corpus/ecommerce-grid/index.html"
+
+[[corpus]]
+name = "login-form"
+start_url = "corpus/login-form/index.html"
+
 [[regression]]
 name = "raw-text-close-lookalikes"
 path = "regressions/raw-text-lookalikes.html"
@@ -50,3 +78,19 @@ path = "regressions/image-decode-fallback.html"
 [[regression]]
 name = "form-get-serialization"
 path = "regressions/form-get.html"
+
+[[malformed]]
+name = "html-recovery"
+path = "malformed/html-recovery.html"
+
+[[malformed]]
+name = "css-recovery"
+path = "malformed/css-recovery.html"
+
+[[malformed]]
+name = "js-recovery"
+path = "malformed/js-recovery.html"
+
+[[malformed]]
+name = "network-boundaries"
+path = "malformed/network-boundaries.html"

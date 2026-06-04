@@ -1,0 +1,5 @@
+body { margin: 8px; background-color: #f1f5f9; color: #0f172a; }
+header { padding: 6px; background-color: #dbeafe; }
+.dashboard { display: grid; grid-template-columns: 120px 120px 120px; gap: 8px; }
+.card { padding: 6px; border: 1px solid #64748b; background-color: #ffffff; }
+table { margin: 6px; background-color: #ffffff; }

@@ -2052,8 +2052,6 @@ Goal: package Webby as a credible from-scratch browser-engine project.
 - Known limitations are honest and specific.
 - No important TODOs remain without follow-up issue references or roadmap entries.
 
---
-
 ---
 
 ## Milestone 61: HTML parsing correctness upgrade
@@ -2379,3 +2377,18 @@ Goal: evaluate Webby against real-world reduced sites and decide the next direct
 - Next roadmap direction is evidence-based.
 - No speculative features are prioritized over recurring failures.
 - Project docs match implemented behavior.
+
+### Post-Milestone 70 direction
+
+The reduced local compatibility corpus remains Webby's deterministic gate.
+Future roadmap items should be created from repeated evidence in
+`docs/COMPATIBILITY.md`, especially:
+
+- remote/snapshot resource coordination for linked stylesheets, scripts,
+  images, and fonts
+- high-frequency CSS diagnostics from real-site smoke output
+- JavaScript DOM/Web API gaps observed repeatedly in local or smoke fixtures
+- SVG/media compatibility gaps that affect reduced fixtures
+
+Do not prioritize speculative browser features without a reduced fixture or
+repeated smoke finding.

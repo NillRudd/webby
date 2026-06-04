@@ -5,16 +5,20 @@
 //! pipeline without reimplementing parsing, styling, layout, URL resolution, or
 //! rendering algorithms.
 
-use webby_cache::{CacheMode, ResourceCache};
+use webby_cache::{CacheMode, DiskResourceCache, ResourceCache};
 use webby_core::{WebbyError, WebbyResult};
 use webby_layout::{
     Dimensions, ElementMetadata, FormControlHitBox, FormControlType, ImageMap, LayoutBox,
-    LayoutKind, LayoutTree, LinkHitBox, Rect, Viewport,
+    LayoutKind, LayoutTree, LinkHitBox, Rect, ScrollOffsets, Viewport,
 };
-use webby_net::{ResourceLoader, ResourceResponse, decode_text_utf8};
+use webby_net::{
+    BasicAuthChallenge, BasicCredentials, DownloadMetadata, NavigationResponseDisposition,
+    ResourceLoader, ResourceResponse, basic_auth_header, decode_text,
+};
 use webby_render::{
-    Color, DisplayList, FontWeight, FormControlVisualState, Surface, build_display_list,
-    draw_text_control_overlay, render_to_surface,
+    Color, DisplayList, FontWeight, FormControlVisualState, RenderBackend, SoftwareRenderBackend,
+    Surface, build_display_list, build_display_list_with_scroll_offsets, draw_text_control_overlay,
+    render_with_backend,
 };
 use webby_state::{Bookmark, BrowserProfile, CookieJar, ProfileStore, StorageState};
 use webby_url::{
@@ -27,6 +31,8 @@ use std::collections::BTreeMap;
 
 /// Height reserved for browser chrome in native-window pixels.
 pub const CHROME_HEIGHT: usize = 48;
+/// Advisory node-count threshold for large-document pipeline diagnostics.
+pub const LARGE_DOCUMENT_NODE_DIAGNOSTIC_THRESHOLD: usize = 1_000;
 const TAB_STRIP_HEIGHT: usize = 18;
 const CHROME_BUTTON_Y: usize = 22;
 const CHROME_BUTTON_SIZE: usize = 20;
@@ -52,6 +58,8 @@ pub struct BrowserChrome {
     pub address_focused: bool,
     /// Whether the next typed character replaces the whole address field.
     pub address_selected: bool,
+    /// UTF-8 byte offset for the address insertion cursor.
+    pub address_cursor: usize,
 }
 
 impl BrowserChrome {
@@ -61,6 +69,7 @@ impl BrowserChrome {
             address_input: STARTUP_ADDRESS.to_string(),
             address_focused: true,
             address_selected: true,
+            address_cursor: STARTUP_ADDRESS.len(),
         }
     }
 
@@ -68,34 +77,119 @@ impl BrowserChrome {
     pub fn set_address_input(&mut self, input: impl Into<String>) {
         self.address_input = input.into();
         self.address_selected = false;
+        self.address_cursor = self.address_input.len();
     }
 
     /// Focuses the address/search field.
     pub fn focus_address(&mut self, select_all: bool) {
         self.address_focused = true;
         self.address_selected = select_all;
+        self.address_cursor = self.address_input.len();
     }
 
     /// Appends one typed character to the address/search bar.
     pub fn type_character(&mut self, character: char) {
         if !character.is_control() {
+            self.address_cursor = floor_char_boundary(&self.address_input, self.address_cursor);
             if self.address_selected {
                 self.address_input.clear();
                 self.address_selected = false;
+                self.address_cursor = 0;
             }
-            self.address_input.push(character);
+            self.address_input.insert(self.address_cursor, character);
+            self.address_cursor = self.address_cursor.saturating_add(character.len_utf8());
         }
     }
 
     /// Removes the last address/search character, if any.
     pub fn backspace(&mut self) {
+        self.address_cursor = floor_char_boundary(&self.address_input, self.address_cursor);
         if self.address_selected {
             self.address_input.clear();
             self.address_selected = false;
+            self.address_cursor = 0;
         } else {
-            self.address_input.pop();
+            let previous = previous_char_boundary(&self.address_input, self.address_cursor);
+            if previous < self.address_cursor {
+                self.address_input.drain(previous..self.address_cursor);
+                self.address_cursor = previous;
+            }
         }
     }
+
+    /// Moves the address insertion cursor one Unicode scalar to the left.
+    pub fn move_cursor_left(&mut self) {
+        self.address_selected = false;
+        self.address_cursor = previous_char_boundary(
+            &self.address_input,
+            floor_char_boundary(&self.address_input, self.address_cursor),
+        );
+    }
+
+    /// Moves the address insertion cursor one Unicode scalar to the right.
+    pub fn move_cursor_right(&mut self) {
+        self.address_selected = false;
+        self.address_cursor = next_char_boundary(
+            &self.address_input,
+            floor_char_boundary(&self.address_input, self.address_cursor),
+        );
+    }
+
+    /// Moves the address insertion cursor to the beginning.
+    pub fn move_cursor_home(&mut self) {
+        self.address_selected = false;
+        self.address_cursor = 0;
+    }
+
+    /// Moves the address insertion cursor to the end.
+    pub fn move_cursor_end(&mut self) {
+        self.address_selected = false;
+        self.address_cursor = self.address_input.len();
+    }
+
+    /// Replaces the current selection or inserts clipboard text at the cursor.
+    pub fn paste(&mut self, text: &str) {
+        let filtered = text
+            .chars()
+            .filter(|character| !character.is_control())
+            .collect::<String>();
+        if self.address_selected {
+            self.address_input.clear();
+            self.address_cursor = 0;
+            self.address_selected = false;
+        }
+        self.address_cursor = floor_char_boundary(&self.address_input, self.address_cursor);
+        self.address_input
+            .insert_str(self.address_cursor, &filtered);
+        self.address_cursor = self.address_cursor.saturating_add(filtered.len());
+    }
+
+    /// Returns selected address text. Webby's v0.1 selection is select-all.
+    pub fn selected_text(&self) -> Option<&str> {
+        self.address_selected.then_some(self.address_input.as_str())
+    }
+}
+
+fn floor_char_boundary(text: &str, cursor: usize) -> usize {
+    let mut cursor = cursor.min(text.len());
+    while !text.is_char_boundary(cursor) {
+        cursor = cursor.saturating_sub(1);
+    }
+    cursor
+}
+
+fn previous_char_boundary(text: &str, cursor: usize) -> usize {
+    text.get(..cursor.min(text.len()))
+        .and_then(|prefix| prefix.char_indices().next_back().map(|(index, _)| index))
+        .unwrap_or(0)
+}
+
+fn next_char_boundary(text: &str, cursor: usize) -> usize {
+    let cursor = cursor.min(text.len());
+    text.get(cursor..)
+        .and_then(|suffix| suffix.chars().next().map(char::len_utf8))
+        .map(|width| cursor.saturating_add(width))
+        .unwrap_or(text.len())
 }
 
 impl Default for BrowserChrome {
@@ -117,7 +211,39 @@ pub struct NavigationController {
     pub history: Vec<url::Url>,
     /// Current index into committed navigation history.
     pub history_index: Option<usize>,
+    /// Monotonic token for the most recently started navigation.
+    pub generation: u64,
+    /// Generation token for the currently committed page.
+    pub active_page_generation: Option<u64>,
+    /// Testable lifecycle state for the active navigation/page.
+    pub lifecycle: NavigationLifecycle,
+    /// Deterministic lifecycle diagnostics, including cancellation notes.
+    pub lifecycle_diagnostics: Vec<String>,
     pending_history_action: Option<PendingHistoryAction>,
+}
+
+/// Explicit app-owned navigation lifecycle state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum NavigationLifecycle {
+    /// No navigation is currently active.
+    #[default]
+    Idle,
+    /// Address/search input is being resolved.
+    Resolving,
+    /// Main resource loading has started.
+    LoadingMainResource,
+    /// Subresource loading is part of the active page pipeline.
+    LoadingSubresources,
+    /// Script execution is part of the active page pipeline.
+    ExecutingScripts,
+    /// Layout/display-list/render work is applying the loaded document.
+    Rendering,
+    /// The page completed successfully.
+    Complete,
+    /// The active navigation failed.
+    Failed,
+    /// A previous navigation was cancelled by a newer one.
+    Cancelled,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -170,11 +296,69 @@ pub enum HoverTarget {
     FormControl(usize),
 }
 
+/// Keyboard-focus target inside page content.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyboardFocusTarget {
+    /// Link hit region by layout-order index.
+    Link { index: usize },
+    /// Form control by stable layout control id.
+    FormControl { id: usize },
+}
+
+/// Basic accessibility role exposed for debugging and keyboard behavior.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessibleRole {
+    /// Hyperlink.
+    Link,
+    /// Push button or submit/reset button.
+    Button,
+    /// Editable text/search/password/email/textarea control.
+    Textbox,
+    /// Checkbox control.
+    Checkbox,
+    /// Radio control.
+    Radio,
+}
+
+/// State metadata for an accessible node.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct AccessibleState {
+    /// Whether the control is disabled.
+    pub disabled: bool,
+    /// Whether a checkbox/radio is checked.
+    pub checked: Option<bool>,
+    /// Whether this node currently has keyboard focus.
+    pub focused: bool,
+}
+
+/// Inspectable accessibility metadata derived from the loaded page.
+#[derive(Debug, Clone, PartialEq)]
+pub struct AccessibleNode {
+    /// Accessibility role.
+    pub role: AccessibleRole,
+    /// Deterministic accessible name.
+    pub name: String,
+    /// Window-independent page rectangle.
+    pub rect: Rect,
+    /// Source DOM node id, when known.
+    pub node_id: Option<webby_dom::NodeId>,
+    /// Link href for link nodes.
+    pub href: Option<String>,
+    /// Form control id for form nodes.
+    pub control_id: Option<usize>,
+    /// Basic state metadata.
+    pub state: AccessibleState,
+}
+
 /// Rendered page data held by app state.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RenderedPage {
     /// URL that produced this page.
     pub url: url::Url,
+    /// Document title shown by browser chrome.
+    pub title: String,
+    /// First favicon/icon href exposed by the document, if present.
+    pub favicon_href: Option<String>,
     /// DOM document after inline scripts and DOM mutations have run.
     pub document: webby_dom::Document,
     /// Event handlers registered by inline scripts.
@@ -336,8 +520,12 @@ pub struct BrowserTab {
     pub page: Option<RenderedPage>,
     /// Vertical scroll offset for this tab.
     pub scroll_y: f32,
+    /// Per-container nested scroll offsets for this tab.
+    pub scroll_offsets: ScrollOffsets,
     /// Focused form control id for this tab.
     pub focused_form_control: Option<usize>,
+    /// Keyboard-focused page target for this tab.
+    pub keyboard_focus: Option<KeyboardFocusTarget>,
     /// Edited form input values for this tab.
     pub form_values: BTreeMap<usize, String>,
     /// Deterministic one-shot timers owned by this tab.
@@ -346,6 +534,12 @@ pub struct BrowserTab {
     pub session_storage: StorageState,
     /// Active visual transition for this tab.
     pub active_transition: Option<ActiveTransition>,
+    /// Current find-in-page query.
+    pub find_query: String,
+    /// Number of visible-text matches for the current query.
+    pub find_match_count: usize,
+    /// Whether find-in-page input is active.
+    pub find_active: bool,
 }
 
 impl BrowserTab {
@@ -357,11 +551,16 @@ impl BrowserTab {
             status: PageStatus::Startup,
             page: None,
             scroll_y: 0.0,
+            scroll_offsets: ScrollOffsets::new(),
             focused_form_control: None,
+            keyboard_focus: None,
             form_values: BTreeMap::new(),
             timers: Vec::new(),
             session_storage: StorageState::default(),
             active_transition: None,
+            find_query: String::new(),
+            find_match_count: 0,
+            find_active: false,
         }
     }
 }
@@ -377,6 +576,32 @@ pub struct BrowserTimer {
     pub delay_ms: u32,
     /// URL of the page that created the timer.
     pub page_url: String,
+    /// Navigation generation of the page that created the timer.
+    pub page_generation: u64,
+}
+
+/// One deterministic shell-managed resource download.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DownloadRecord {
+    /// Final resource URL written by the shell.
+    pub url: url::Url,
+    /// Sanitized destination filename.
+    pub filename: String,
+    /// Destination path selected by the caller.
+    pub destination: std::path::PathBuf,
+    /// Number of bytes written.
+    pub byte_len: usize,
+}
+
+/// Visible HTTP Basic authentication challenge state.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AuthChallengeState {
+    /// Protected resource URL.
+    pub url: url::Url,
+    /// Origin key used for the in-memory credential map.
+    pub origin: String,
+    /// Redacted challenge metadata.
+    pub challenge: BasicAuthChallenge,
 }
 
 impl Default for BrowserTab {
@@ -406,8 +631,12 @@ pub struct AppState {
     pub window_height: usize,
     /// Vertical scroll offset for page content.
     pub scroll_y: f32,
+    /// Per-container nested scroll offsets for the active tab.
+    pub scroll_offsets: ScrollOffsets,
     /// Focused form control id, if keyboard input is directed into page content.
     pub focused_form_control: Option<usize>,
+    /// Keyboard-focused page target.
+    pub keyboard_focus: Option<KeyboardFocusTarget>,
     /// Edited form input values keyed by layout control id.
     pub form_values: BTreeMap<usize, String>,
     /// Deterministic one-shot timers for the active tab.
@@ -416,6 +645,28 @@ pub struct AppState {
     pub session_storage: StorageState,
     /// Active deterministic transition for the visible page.
     pub active_transition: Option<ActiveTransition>,
+    /// Current find-in-page query for the active tab.
+    pub find_query: String,
+    /// Number of visible-text matches for the current query.
+    pub find_match_count: usize,
+    /// Whether find-in-page input is active.
+    pub find_active: bool,
+    /// App-local clipboard used by deterministic shell shortcuts.
+    pub clipboard: String,
+    /// Whether keyboard shortcut help is visible.
+    pub shortcut_help_visible: bool,
+    /// Shell-managed resource downloads completed this session.
+    pub downloads: Vec<DownloadRecord>,
+    /// Directory used for downloads started by normal page navigation.
+    pub download_directory: std::path::PathBuf,
+    /// Deterministic shell download diagnostics.
+    pub download_diagnostics: Vec<String>,
+    /// In-memory HTTP Basic credentials keyed by Webby origin.
+    pub basic_auth_credentials: BTreeMap<String, BasicCredentials>,
+    /// Current redacted Basic-auth challenge, if navigation needs credentials.
+    pub auth_challenge: Option<AuthChallengeState>,
+    /// Deterministic authentication diagnostics with credentials redacted.
+    pub auth_diagnostics: Vec<String>,
     /// Whether visual transitions are enabled.
     pub animations_enabled: bool,
     /// Whether the debug layout overlay is visible.
@@ -440,6 +691,8 @@ pub struct AppState {
     pub local_storage: StorageState,
     /// Shared in-memory byte cache for page, stylesheet, and image resources.
     pub resource_cache: ResourceCache,
+    /// Optional persistent disk tier below the in-memory resource cache.
+    pub disk_cache: Option<DiskResourceCache>,
 }
 
 impl AppState {
@@ -461,11 +714,24 @@ impl AppState {
             window_width: width.max(1),
             window_height: height.max(CHROME_HEIGHT + 1),
             scroll_y: tab.scroll_y,
+            scroll_offsets: tab.scroll_offsets,
             focused_form_control: tab.focused_form_control,
+            keyboard_focus: tab.keyboard_focus,
             form_values: tab.form_values,
             timers: tab.timers,
             session_storage: tab.session_storage,
             active_transition: tab.active_transition,
+            find_query: tab.find_query,
+            find_match_count: tab.find_match_count,
+            find_active: tab.find_active,
+            clipboard: String::new(),
+            shortcut_help_visible: false,
+            downloads: Vec::new(),
+            download_directory: default_download_directory(),
+            download_diagnostics: Vec::new(),
+            basic_auth_credentials: BTreeMap::new(),
+            auth_challenge: None,
+            auth_diagnostics: Vec::new(),
             animations_enabled: true,
             debug_overlay_enabled: false,
             selected_inspection: None,
@@ -478,6 +744,7 @@ impl AppState {
             storage_enabled: true,
             local_storage: StorageState::default(),
             resource_cache: ResourceCache::new(),
+            disk_cache: None,
         }
     }
 
@@ -507,6 +774,22 @@ impl AppState {
         Ok(state)
     }
 
+    /// Enables the persistent resource cache for this app session.
+    pub fn enable_disk_cache(&mut self, root: impl Into<std::path::PathBuf>) -> WebbyResult<()> {
+        self.disk_cache = Some(DiskResourceCache::open(root)?);
+        Ok(())
+    }
+
+    /// Clears non-persistent sessionStorage across open tabs without closing or
+    /// corrupting active browsing contexts.
+    pub fn clear_session_storage(&mut self) {
+        self.session_storage.clear();
+        for tab in &mut self.tabs {
+            tab.session_storage.clear();
+        }
+        self.save_active_tab();
+    }
+
     /// Number of open tabs.
     pub fn tab_count(&self) -> usize {
         self.tabs.len()
@@ -531,11 +814,16 @@ impl AppState {
             || self.status != tab.status
             || self.page != tab.page
             || self.scroll_y != tab.scroll_y
+            || self.scroll_offsets != tab.scroll_offsets
             || self.focused_form_control != tab.focused_form_control
+            || self.keyboard_focus != tab.keyboard_focus
             || self.form_values != tab.form_values
             || self.timers != tab.timers
             || self.session_storage != tab.session_storage
             || self.active_transition != tab.active_transition
+            || self.find_query != tab.find_query
+            || self.find_match_count != tab.find_match_count
+            || self.find_active != tab.find_active
         {
             return Err(WebbyError::invalid_input(
                 "active tab compatibility view is out of sync with authoritative tab state",
@@ -780,7 +1068,9 @@ impl AppState {
         }
     }
 
-    fn install_rerendered_page(&mut self, page: RenderedPage) {
+    fn install_rerendered_page(&mut self, mut page: RenderedPage) {
+        let _ =
+            apply_nested_scroll_offsets_to_page(&mut page, &self.scroll_offsets, self.window_width);
         let transition = self.page.as_ref().and_then(|previous| {
             transition_between_pages(previous, &page, self.animations_enabled)
         });
@@ -789,9 +1079,264 @@ impl AppState {
         self.save_active_tab();
     }
 
+    /// Selects the whole address field.
+    pub fn select_all_address(&mut self) {
+        self.find_active = false;
+        self.chrome.focus_address(true);
+        self.save_active_tab();
+    }
+
+    /// Moves the address insertion cursor one character left.
+    pub fn move_address_cursor_left(&mut self) {
+        if self.chrome.address_focused {
+            self.chrome.move_cursor_left();
+            self.save_active_tab();
+        }
+    }
+
+    /// Moves the address insertion cursor one character right.
+    pub fn move_address_cursor_right(&mut self) {
+        if self.chrome.address_focused {
+            self.chrome.move_cursor_right();
+            self.save_active_tab();
+        }
+    }
+
+    /// Moves the address insertion cursor to the beginning.
+    pub fn move_address_cursor_home(&mut self) {
+        if self.chrome.address_focused {
+            self.chrome.move_cursor_home();
+            self.save_active_tab();
+        }
+    }
+
+    /// Moves the address insertion cursor to the end.
+    pub fn move_address_cursor_end(&mut self) {
+        if self.chrome.address_focused {
+            self.chrome.move_cursor_end();
+            self.save_active_tab();
+        }
+    }
+
+    /// Copies selected address text, or the committed URL when nothing is selected.
+    pub fn copy_address_or_current_url(&mut self) -> bool {
+        let value = self.chrome.selected_text().map(str::to_string).or_else(|| {
+            self.navigation
+                .current_url
+                .as_ref()
+                .map(url::Url::to_string)
+        });
+        let Some(value) = value else {
+            return false;
+        };
+        self.clipboard = value;
+        true
+    }
+
+    /// Pastes app-local clipboard text into the focused address field.
+    pub fn paste_address(&mut self) -> bool {
+        if !self.chrome.address_focused {
+            return false;
+        }
+        self.chrome.paste(&self.clipboard);
+        self.save_active_tab();
+        true
+    }
+
+    /// Opens find-in-page input for the active tab.
+    pub fn open_find(&mut self) {
+        self.find_active = true;
+        self.chrome.address_focused = false;
+        self.update_find_matches();
+        self.save_active_tab();
+    }
+
+    /// Closes find-in-page input without clearing its query.
+    pub fn close_find(&mut self) {
+        self.find_active = false;
+        self.save_active_tab();
+    }
+
+    /// Toggles the keyboard-shortcut help panel.
+    pub fn toggle_shortcut_help(&mut self) {
+        self.shortcut_help_visible = !self.shortcut_help_visible;
+    }
+
+    /// Returns the current page title, falling back to the committed URL.
+    pub fn window_title(&self) -> String {
+        self.page
+            .as_ref()
+            .map(|page| page.title.clone())
+            .filter(|title| !title.is_empty())
+            .or_else(|| {
+                self.navigation
+                    .current_url
+                    .as_ref()
+                    .map(url::Url::to_string)
+            })
+            .unwrap_or_else(|| "Webby".to_string())
+    }
+
+    /// Returns concise visible shell status, including hovered-link feedback.
+    pub fn status_bar_text(&self) -> String {
+        if let Some(HoverTarget::Link(href)) = &self.hover_target {
+            return href.clone();
+        }
+        match &self.status {
+            PageStatus::Startup => "Ready".to_string(),
+            PageStatus::Loading { url } => format!("Loading {url}"),
+            PageStatus::Loaded { .. } => self.page.as_ref().map_or_else(
+                || "Loaded".to_string(),
+                |page| format!("Ready diagnostics={}", page.diagnostics.len()),
+            ),
+            PageStatus::Error { message } => format!("Error: {message}"),
+        }
+    }
+
+    /// Resolves and opens a local HTML file through normal page navigation.
+    pub fn open_file<L: ResourceLoader>(&mut self, loader: &L, path: &std::path::Path) -> bool {
+        let absolute = match path.canonicalize() {
+            Ok(path) => path,
+            Err(source) => {
+                self.set_error(WebbyError::Io {
+                    path: Some(path.to_path_buf()),
+                    source,
+                });
+                return false;
+            }
+        };
+        let target = match url::Url::from_file_path(&absolute) {
+            Ok(url) => url,
+            Err(()) => {
+                self.set_error(WebbyError::Url {
+                    message: format!(
+                        "could not convert open-file path to URL: {}",
+                        absolute.display()
+                    ),
+                });
+                return false;
+            }
+        };
+        self.navigate_to_url(loader, target);
+        matches!(self.status, PageStatus::Loaded { .. })
+    }
+
+    /// Downloads one resource through the supplied loader to an explicit path.
+    pub fn download_resource<L: ResourceLoader>(
+        &mut self,
+        loader: &L,
+        url: &url::Url,
+        destination: &std::path::Path,
+    ) -> WebbyResult<DownloadRecord> {
+        let response = loader.load(url)?;
+        std::fs::write(destination, &response.bytes).map_err(|source| WebbyError::Io {
+            path: Some(destination.to_path_buf()),
+            source,
+        })?;
+        let record = DownloadRecord {
+            url: response.final_url,
+            filename: destination
+                .file_name()
+                .and_then(|filename| filename.to_str())
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| "download".to_string()),
+            destination: destination.to_path_buf(),
+            byte_len: response.bytes.len(),
+        };
+        self.downloads.push(record.clone());
+        Ok(record)
+    }
+
+    /// Replaces the directory used for navigation-triggered downloads.
+    pub fn set_download_directory(&mut self, directory: impl Into<std::path::PathBuf>) {
+        self.download_directory = directory.into();
+    }
+
+    /// Stores HTTP Basic credentials in memory for one origin.
+    pub fn set_basic_auth_credentials(
+        &mut self,
+        url: &url::Url,
+        username: impl Into<String>,
+        password: impl Into<String>,
+    ) -> WebbyResult<()> {
+        let origin = webby_security::origin_key(url)?;
+        self.basic_auth_credentials
+            .insert(origin, BasicCredentials::new(username, password));
+        self.auth_challenge = None;
+        self.save_active_tab();
+        Ok(())
+    }
+
+    fn complete_navigation_download(
+        &mut self,
+        response: ResourceResponse,
+        metadata: DownloadMetadata,
+        mut diagnostics: Vec<String>,
+    ) {
+        let result = self.write_download_response(&response, &metadata);
+        match result {
+            Ok(record) => {
+                diagnostics.push(format!(
+                    "download complete url={} destination={} bytes={} reason={}",
+                    record.url,
+                    record.destination.display(),
+                    record.byte_len,
+                    metadata.reason
+                ));
+                self.downloads.push(record);
+                self.download_diagnostics.extend(diagnostics);
+                self.navigation.pending_url = None;
+                self.navigation.pending_history_action = None;
+                self.navigation.failed_url = None;
+                self.navigation.lifecycle = NavigationLifecycle::Complete;
+                self.status = if let Some(url) = self.navigation.current_url.as_ref() {
+                    PageStatus::Loaded {
+                        url: url.to_string(),
+                    }
+                } else {
+                    PageStatus::Startup
+                };
+                self.save_active_tab();
+            }
+            Err(error) => self.set_navigation_error(error),
+        }
+    }
+
+    fn write_download_response(
+        &self,
+        response: &ResourceResponse,
+        metadata: &DownloadMetadata,
+    ) -> WebbyResult<DownloadRecord> {
+        std::fs::create_dir_all(&self.download_directory).map_err(|source| WebbyError::Io {
+            path: Some(self.download_directory.clone()),
+            source,
+        })?;
+        let filename = sanitize_download_filename(&metadata.suggested_filename);
+        let destination = unique_download_destination(&self.download_directory, &filename);
+        std::fs::write(&destination, &response.bytes).map_err(|source| WebbyError::Io {
+            path: Some(destination.clone()),
+            source,
+        })?;
+        Ok(DownloadRecord {
+            url: response.final_url.clone(),
+            filename: destination
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| filename.clone()),
+            destination,
+            byte_len: response.bytes.len(),
+        })
+    }
+
     /// Adds a character to the focused address bar.
     pub fn type_character(&mut self, character: char) {
-        if self.chrome.address_focused {
+        if self.find_active {
+            if !character.is_control() {
+                self.find_query.push(character);
+                self.update_find_matches();
+            }
+        } else if self.chrome.address_focused {
             self.chrome.type_character(character);
         } else if let Some(control_id) = self.focused_form_control
             && !character.is_control()
@@ -808,7 +1353,10 @@ impl AppState {
 
     /// Removes one character from the address bar.
     pub fn backspace(&mut self) {
-        if self.chrome.address_focused {
+        if self.find_active {
+            self.find_query.pop();
+            self.update_find_matches();
+        } else if self.chrome.address_focused {
             self.chrome.backspace();
         } else if let Some(control_id) = self.focused_form_control
             && focused_control_is_text_editable(self.page.as_ref(), control_id)
@@ -820,6 +1368,113 @@ impl AppState {
             let _ = self.dispatch_input_event_for_control(control_id);
         }
         self.save_active_tab();
+    }
+
+    fn update_find_matches(&mut self) {
+        self.find_match_count = find_match_count(self.page.as_ref(), &self.find_query);
+    }
+
+    /// Moves keyboard focus to the next page link or form control.
+    pub fn focus_next_page_item(&mut self) -> bool {
+        self.move_page_focus(false)
+    }
+
+    /// Moves keyboard focus to the previous page link or form control.
+    pub fn focus_previous_page_item(&mut self) -> bool {
+        self.move_page_focus(true)
+    }
+
+    /// Activates the currently focused link or form control with Enter.
+    pub fn activate_keyboard_focus<L: ResourceLoader>(&mut self, loader: &L) -> bool {
+        let Some(target) = self.keyboard_focus else {
+            return false;
+        };
+        match target {
+            KeyboardFocusTarget::Link { index } => {
+                let Some(link) = self
+                    .page
+                    .as_ref()
+                    .and_then(|page| page.links.get(index))
+                    .cloned()
+                else {
+                    return false;
+                };
+                self.activate_link_hit(loader, link)
+            }
+            KeyboardFocusTarget::FormControl { id } => {
+                self.activate_form_control_by_keyboard(loader, id, KeyboardActivation::Enter)
+            }
+        }
+    }
+
+    /// Activates Space semantics for the currently focused button/checkbox/radio.
+    pub fn press_space_on_keyboard_focus<L: ResourceLoader>(&mut self, loader: &L) -> bool {
+        let Some(KeyboardFocusTarget::FormControl { id }) = self.keyboard_focus else {
+            return false;
+        };
+        self.activate_form_control_by_keyboard(loader, id, KeyboardActivation::Space)
+    }
+
+    /// Scrolls the page from keyboard input and clamps to valid extents.
+    pub fn keyboard_scroll_by(&mut self, delta_y: f32) {
+        self.scroll_by(delta_y);
+    }
+
+    /// Returns inspectable accessibility metadata for the loaded page.
+    pub fn accessible_nodes(&self) -> Vec<AccessibleNode> {
+        let Some(page) = &self.page else {
+            return Vec::new();
+        };
+        if !matches!(self.status, PageStatus::Loaded { .. }) {
+            return Vec::new();
+        }
+        let mut nodes = Vec::new();
+        for (index, link) in page.links.iter().enumerate() {
+            nodes.push(AccessibleNode {
+                role: AccessibleRole::Link,
+                name: link
+                    .node_id
+                    .and_then(|node_id| page.document.find_node(node_id))
+                    .map(node_text_content)
+                    .filter(|name| !name.trim().is_empty())
+                    .unwrap_or_else(|| link.href.clone()),
+                rect: link.rect,
+                node_id: link.node_id,
+                href: Some(link.href.clone()),
+                control_id: None,
+                state: AccessibleState {
+                    focused: self.keyboard_focus == Some(KeyboardFocusTarget::Link { index }),
+                    ..AccessibleState::default()
+                },
+            });
+        }
+        for control in &page.form_controls {
+            if control.disabled {
+                continue;
+            }
+            let node_id = find_form_control_node_id(&page.document.root, control.id);
+            nodes.push(AccessibleNode {
+                role: accessible_role_for_control(control.control_type),
+                name: accessible_name_for_control(page, control, node_id),
+                rect: control.rect,
+                node_id,
+                href: None,
+                control_id: Some(control.id),
+                state: AccessibleState {
+                    disabled: control.disabled,
+                    checked: match control.control_type {
+                        FormControlType::Checkbox | FormControlType::Radio => {
+                            Some(control_checked_state(control, &self.form_values))
+                        }
+                        _ => None,
+                    },
+                    focused: self.keyboard_focus
+                        == Some(KeyboardFocusTarget::FormControl { id: control.id }),
+                },
+            });
+        }
+        nodes.sort_by(focusable_node_order);
+        nodes
     }
 
     /// Handles Enter from a focused form input.
@@ -840,6 +1495,7 @@ impl AppState {
 
     /// Resolves current address/search text and transitions to loading state.
     pub fn begin_navigation(&mut self) -> Option<url::Url> {
+        self.navigation.lifecycle = NavigationLifecycle::Resolving;
         let target = match resolve_address_input(&self.chrome.address_input) {
             Ok(url) => url,
             Err(error) => {
@@ -854,18 +1510,33 @@ impl AppState {
 
     /// Starts navigation to an already resolved URL.
     fn begin_navigation_to_url(&mut self, target: url::Url, action: PendingHistoryAction) {
+        self.cancel_pending_navigation_for_new_target(&target);
+        self.navigation.generation = self.navigation.generation.saturating_add(1);
         self.navigation.pending_url = Some(target.clone());
         self.navigation.pending_history_action = Some(action);
+        self.navigation.lifecycle = NavigationLifecycle::LoadingMainResource;
         self.timers.clear();
         self.active_transition = None;
         self.status = PageStatus::Loading {
             url: target.to_string(),
         };
         self.focused_form_control = None;
+        self.keyboard_focus = None;
         self.hovered_node_id = None;
         self.hover_target = None;
         self.selected_inspection = None;
         self.save_active_tab();
+    }
+
+    fn cancel_pending_navigation_for_new_target(&mut self, next_target: &url::Url) {
+        let Some(previous) = self.navigation.pending_url.as_ref() else {
+            return;
+        };
+        self.navigation.lifecycle = NavigationLifecycle::Cancelled;
+        self.navigation.lifecycle_diagnostics.push(format!(
+            "navigation cancelled generation={} url={} replaced_by={}",
+            self.navigation.generation, previous, next_target
+        ));
     }
 
     /// Navigates to an already resolved URL and commits on success.
@@ -928,6 +1599,7 @@ impl AppState {
                 | FormControlType::Textarea => {
                     self.chrome.address_focused = false;
                     self.focused_form_control = Some(control.id);
+                    self.keyboard_focus = Some(KeyboardFocusTarget::FormControl { id: control.id });
                     self.form_values
                         .entry(control.id)
                         .or_insert_with(|| control.value.clone());
@@ -938,12 +1610,14 @@ impl AppState {
                 FormControlType::Submit => {
                     self.chrome.address_focused = false;
                     self.focused_form_control = None;
+                    self.keyboard_focus = Some(KeyboardFocusTarget::FormControl { id: control.id });
                     self.rerender_loaded_page_for_current_viewport();
                     return self.submit_form_for_control(loader, control.id, Some(control.id));
                 }
                 FormControlType::Checkbox => {
                     self.chrome.address_focused = false;
                     self.focused_form_control = None;
+                    self.keyboard_focus = Some(KeyboardFocusTarget::FormControl { id: control.id });
                     let new_value = if control_checked_state(&control, &self.form_values) {
                         "false"
                     } else {
@@ -957,6 +1631,7 @@ impl AppState {
                 FormControlType::Radio => {
                     self.chrome.address_focused = false;
                     self.focused_form_control = None;
+                    self.keyboard_focus = Some(KeyboardFocusTarget::FormControl { id: control.id });
                     self.select_radio_control(&control);
                     let _ = self.dispatch_input_event_for_control(control.id);
                     self.save_active_tab();
@@ -965,6 +1640,7 @@ impl AppState {
                 FormControlType::Select => {
                     self.chrome.address_focused = false;
                     self.focused_form_control = None;
+                    self.keyboard_focus = Some(KeyboardFocusTarget::FormControl { id: control.id });
                     if let Some(next) = next_select_value(&control, &self.form_values) {
                         self.form_values.insert(control.id, next);
                         let _ = self.dispatch_input_event_for_control(control.id);
@@ -975,11 +1651,18 @@ impl AppState {
                 FormControlType::Reset => {
                     self.chrome.address_focused = false;
                     self.focused_form_control = None;
+                    self.keyboard_focus = Some(KeyboardFocusTarget::FormControl { id: control.id });
                     self.reset_form_for_control(&control);
                     self.save_active_tab();
                     return true;
                 }
-                FormControlType::Button => return true,
+                FormControlType::Button => {
+                    self.chrome.address_focused = false;
+                    self.focused_form_control = None;
+                    self.keyboard_focus = Some(KeyboardFocusTarget::FormControl { id: control.id });
+                    self.save_active_tab();
+                    return true;
+                }
             }
         }
 
@@ -994,6 +1677,25 @@ impl AppState {
             }
             return false;
         };
+        self.keyboard_focus = link
+            .node_id
+            .and_then(|node_id| {
+                self.page.as_ref().and_then(|page| {
+                    page.links
+                        .iter()
+                        .position(|candidate| candidate.node_id == Some(node_id))
+                })
+            })
+            .or_else(|| {
+                self.page.as_ref().and_then(|page| {
+                    page.links.iter().position(|candidate| {
+                        candidate.href == link.href && candidate.rect == link.rect
+                    })
+                })
+            })
+            .map(|index| KeyboardFocusTarget::Link { index });
+        self.focused_form_control = None;
+        self.chrome.address_focused = false;
         let before_url = self.navigation.current_url.clone();
         if let Some(default_prevented) = self.dispatch_event_for_link("click", &link) {
             self.apply_loaded_page_browser_actions(loader);
@@ -1011,6 +1713,153 @@ impl AppState {
         self.begin_navigation_to_url(target.clone(), PendingHistoryAction::Push);
         self.load_pending_url(loader, &target, CacheMode::Use);
         true
+    }
+
+    fn move_page_focus(&mut self, reverse: bool) -> bool {
+        if !matches!(self.status, PageStatus::Loaded { .. }) {
+            return false;
+        }
+        let focusables = self.focusable_targets();
+        if focusables.is_empty() {
+            return false;
+        }
+        let current = self
+            .keyboard_focus
+            .and_then(|target| focusables.iter().position(|candidate| *candidate == target));
+        let next_index = match (current, reverse) {
+            (Some(0), true) | (None, true) => focusables.len().saturating_sub(1),
+            (Some(index), true) => index.saturating_sub(1),
+            (Some(index), false) => (index + 1) % focusables.len(),
+            (None, false) => 0,
+        };
+        let target = focusables[next_index];
+        self.chrome.address_focused = false;
+        self.keyboard_focus = Some(target);
+        self.focused_form_control = match target {
+            KeyboardFocusTarget::FormControl { id } => Some(id),
+            KeyboardFocusTarget::Link { .. } => None,
+        };
+        if let KeyboardFocusTarget::FormControl { id } = target
+            && focused_control_is_text_editable(self.page.as_ref(), id)
+        {
+            let value = form_control_value(self.page.as_ref(), id);
+            self.form_values.entry(id).or_insert(value);
+        }
+        self.rerender_loaded_page_for_current_viewport();
+        self.save_active_tab();
+        true
+    }
+
+    fn focusable_targets(&self) -> Vec<KeyboardFocusTarget> {
+        let Some(page) = &self.page else {
+            return Vec::new();
+        };
+        let mut entries = Vec::new();
+        for (index, link) in page.links.iter().enumerate() {
+            entries.push((link.rect, KeyboardFocusTarget::Link { index }));
+        }
+        for control in &page.form_controls {
+            if !control.disabled {
+                entries.push((
+                    control.rect,
+                    KeyboardFocusTarget::FormControl { id: control.id },
+                ));
+            }
+        }
+        entries.sort_by(|(left_rect, left), (right_rect, right)| {
+            compare_focus_rects(*left_rect, *right_rect)
+                .then_with(|| focus_target_key(*left).cmp(&focus_target_key(*right)))
+        });
+        entries.into_iter().map(|(_, target)| target).collect()
+    }
+
+    fn activate_link_hit<L: ResourceLoader>(&mut self, loader: &L, link: LinkHitBox) -> bool {
+        let before_url = self.navigation.current_url.clone();
+        if let Some(default_prevented) = self.dispatch_event_for_link("click", &link) {
+            self.apply_loaded_page_browser_actions(loader);
+            if default_prevented || self.navigation.current_url != before_url {
+                return true;
+            }
+        }
+        let target = match self.resolve_href(&link.href) {
+            Ok(target) => target,
+            Err(error) => {
+                self.set_target_error(link.href, error);
+                return true;
+            }
+        };
+        self.begin_navigation_to_url(target.clone(), PendingHistoryAction::Push);
+        self.load_pending_url(loader, &target, CacheMode::Use);
+        true
+    }
+
+    fn activate_form_control_by_keyboard<L: ResourceLoader>(
+        &mut self,
+        loader: &L,
+        control_id: usize,
+        activation: KeyboardActivation,
+    ) -> bool {
+        let Some(control) = self
+            .page
+            .as_ref()
+            .and_then(|page| {
+                page.form_controls
+                    .iter()
+                    .find(|candidate| candidate.id == control_id)
+            })
+            .cloned()
+        else {
+            return false;
+        };
+        if control.disabled {
+            return false;
+        }
+        match (activation, control.control_type) {
+            (
+                KeyboardActivation::Enter,
+                FormControlType::Text
+                | FormControlType::Search
+                | FormControlType::Password
+                | FormControlType::Email
+                | FormControlType::Textarea,
+            )
+            | (KeyboardActivation::Enter | KeyboardActivation::Space, FormControlType::Submit) => {
+                self.submit_form_for_control(loader, control.id, Some(control.id))
+            }
+            (KeyboardActivation::Enter | KeyboardActivation::Space, FormControlType::Button) => {
+                true
+            }
+            (KeyboardActivation::Space, FormControlType::Checkbox) => {
+                let new_value = if control_checked_state(&control, &self.form_values) {
+                    "false"
+                } else {
+                    "true"
+                };
+                self.form_values.insert(control.id, new_value.to_string());
+                let _ = self.dispatch_input_event_for_control(control.id);
+                self.save_active_tab();
+                true
+            }
+            (KeyboardActivation::Space, FormControlType::Radio) => {
+                self.select_radio_control(&control);
+                let _ = self.dispatch_input_event_for_control(control.id);
+                self.save_active_tab();
+                true
+            }
+            (KeyboardActivation::Enter | KeyboardActivation::Space, FormControlType::Reset) => {
+                self.reset_form_for_control(&control);
+                true
+            }
+            (KeyboardActivation::Enter, FormControlType::Select) => {
+                if let Some(next) = next_select_value(&control, &self.form_values) {
+                    self.form_values.insert(control.id, next);
+                    let _ = self.dispatch_input_event_for_control(control.id);
+                    self.save_active_tab();
+                }
+                true
+            }
+            _ => false,
+        }
     }
 
     /// Returns the browser chrome action under a window coordinate.
@@ -1056,8 +1905,10 @@ impl AppState {
             ChromeAction::Reload => self.reload(loader),
             ChromeAction::BookmarkCurrentPage => false,
             ChromeAction::FocusAddress => {
+                self.find_active = false;
                 self.chrome.focus_address(true);
                 self.focused_form_control = None;
+                self.keyboard_focus = None;
                 self.rerender_loaded_page_for_current_viewport();
                 self.save_active_tab();
                 true
@@ -1099,6 +1950,14 @@ impl AppState {
                 .page
                 .as_ref()
                 .and_then(|page| find_form_control_node_id(&page.document.root, control_id))
+        {
+            interaction = interaction.with_focused_node(node_id);
+        } else if let Some(KeyboardFocusTarget::Link { index }) = self.keyboard_focus
+            && let Some(node_id) = self
+                .page
+                .as_ref()
+                .and_then(|page| page.links.get(index))
+                .and_then(|link| link.node_id)
         {
             interaction = interaction.with_focused_node(node_id);
         }
@@ -1240,6 +2099,25 @@ impl AppState {
 
     /// Applies the result of a pending navigation.
     pub fn finish_navigation(&mut self, result: WebbyResult<RenderedPage>) {
+        let generation = self.navigation.generation;
+        self.finish_navigation_for_generation(generation, result);
+    }
+
+    /// Applies a navigation result only if the generation token is still active.
+    pub fn finish_navigation_for_generation(
+        &mut self,
+        generation: u64,
+        result: WebbyResult<RenderedPage>,
+    ) {
+        if generation != self.navigation.generation {
+            self.navigation.lifecycle_diagnostics.push(format!(
+                "late navigation result ignored generation={} active_generation={}",
+                generation, self.navigation.generation
+            ));
+            self.save_active_tab();
+            return;
+        }
+        self.navigation.lifecycle = NavigationLifecycle::Rendering;
         match result {
             Ok(mut page) => {
                 self.apply_storage_actions_for_page(&mut page);
@@ -1247,13 +2125,16 @@ impl AppState {
                 self.navigation.current_url = Some(page.url.clone());
                 self.navigation.pending_url = None;
                 self.navigation.failed_url = None;
+                self.navigation.active_page_generation = Some(generation);
                 let action = match self.navigation.pending_history_action.take() {
                     Some(action) => action,
                     None => PendingHistoryAction::Push,
                 };
                 commit_history(&mut self.navigation, &page.url, action);
                 self.scroll_y = 0.0;
+                self.scroll_offsets.clear();
                 self.focused_form_control = None;
+                self.keyboard_focus = None;
                 self.hovered_node_id = None;
                 self.hover_target = None;
                 self.form_values.clear();
@@ -1261,9 +2142,11 @@ impl AppState {
                 self.status = PageStatus::Loaded {
                     url: page.url.to_string(),
                 };
+                self.navigation.lifecycle = NavigationLifecycle::Complete;
                 self.timers.clear();
                 self.active_transition = None;
                 self.page = Some(page);
+                self.update_find_matches();
                 self.save_active_tab();
             }
             Err(error) => self.set_navigation_error(error),
@@ -1278,6 +2161,39 @@ impl AppState {
         self.scroll_y += delta_y;
         self.clamp_scroll();
         self.save_active_tab();
+    }
+
+    /// Routes wheel scrolling to the deepest visible nested container, then
+    /// falls back to page-level scrolling.
+    pub fn scroll_at_window_position(&mut self, x: f32, y: f32, delta_y: f32) {
+        if !x.is_finite() || !y.is_finite() || !delta_y.is_finite() || y < CHROME_HEIGHT as f32 {
+            return;
+        }
+        let page_y = y - CHROME_HEIGHT as f32 + self.scroll_y;
+        let target = self.page.as_ref().and_then(|page| {
+            page.layout
+                .visible_scroll_containers(&self.scroll_offsets)
+                .into_iter()
+                .rev()
+                .find(|container| {
+                    point_in_rect(x, page_y, container.viewport) && container.max_scroll_y > 0.0
+                })
+        });
+        let Some(target) = target else {
+            self.scroll_by(delta_y);
+            return;
+        };
+        let offset = self.scroll_offsets.entry(target.id).or_default();
+        offset.y = (offset.y + delta_y).clamp(0.0, target.max_scroll_y);
+        self.rerender_nested_scroll_offsets();
+        self.save_active_tab();
+    }
+
+    fn rerender_nested_scroll_offsets(&mut self) {
+        let Some(page) = self.page.as_mut() else {
+            return;
+        };
+        let _ = apply_nested_scroll_offsets_to_page(page, &self.scroll_offsets, self.window_width);
     }
 
     /// Advances the deterministic animation clock for the active tab.
@@ -1315,6 +2231,7 @@ impl AppState {
                     self.focused_form_control,
                     self.scroll_y,
                 );
+                draw_keyboard_focus_ring(&mut surface, page, self.keyboard_focus, self.scroll_y);
                 if self.debug_overlay_enabled {
                     draw_debug_overlay(
                         &mut surface,
@@ -1337,6 +2254,7 @@ impl AppState {
                 draw_status_message(&mut surface, "Loaded", url);
             }
         }
+        draw_shell_overlay(&mut surface, self);
 
         Ok(surface)
     }
@@ -1344,12 +2262,15 @@ impl AppState {
     fn set_error(&mut self, error: WebbyError) {
         self.navigation.pending_url = None;
         self.navigation.pending_history_action = None;
+        self.navigation.lifecycle = NavigationLifecycle::Failed;
         self.status = PageStatus::Error {
             message: error.to_string(),
         };
         self.active_transition = None;
         self.hovered_node_id = None;
         self.hover_target = None;
+        self.keyboard_focus = None;
+        self.focused_form_control = None;
         self.selected_inspection = None;
         self.clamp_scroll();
         self.save_active_tab();
@@ -1362,12 +2283,55 @@ impl AppState {
             .take()
             .map(|url| url.to_string());
         self.navigation.pending_history_action = None;
+        self.navigation.lifecycle = NavigationLifecycle::Failed;
         self.status = PageStatus::Error {
             message: error.to_string(),
         };
         self.active_transition = None;
         self.hovered_node_id = None;
         self.hover_target = None;
+        self.keyboard_focus = None;
+        self.focused_form_control = None;
+        self.selected_inspection = None;
+        self.clamp_scroll();
+        self.save_active_tab();
+    }
+
+    fn set_auth_challenge(
+        &mut self,
+        url: url::Url,
+        challenge: BasicAuthChallenge,
+        diagnostics: Vec<String>,
+        failed: bool,
+    ) {
+        self.navigation.failed_url = self
+            .navigation
+            .pending_url
+            .take()
+            .map(|url| url.to_string());
+        self.navigation.pending_history_action = None;
+        self.navigation.lifecycle = NavigationLifecycle::Failed;
+        let origin =
+            webby_security::origin_key(&url).unwrap_or_else(|_| url.origin().ascii_serialization());
+        self.auth_diagnostics.extend(diagnostics);
+        self.auth_diagnostics.push(challenge.diagnostic(&url));
+        self.auth_challenge = Some(AuthChallengeState {
+            url: url.clone(),
+            origin,
+            challenge: challenge.clone(),
+        });
+        self.status = PageStatus::Error {
+            message: if failed {
+                format!("authentication failed for {url}")
+            } else {
+                challenge.diagnostic(&url)
+            },
+        };
+        self.active_transition = None;
+        self.hovered_node_id = None;
+        self.hover_target = None;
+        self.keyboard_focus = None;
+        self.focused_form_control = None;
         self.selected_inspection = None;
         self.clamp_scroll();
         self.save_active_tab();
@@ -1377,18 +2341,23 @@ impl AppState {
         self.navigation.pending_url = None;
         self.navigation.pending_history_action = None;
         self.navigation.failed_url = Some(target);
+        self.navigation.lifecycle = NavigationLifecycle::Failed;
         self.status = PageStatus::Error {
             message: error.to_string(),
         };
         self.active_transition = None;
         self.hovered_node_id = None;
         self.hover_target = None;
+        self.keyboard_focus = None;
+        self.focused_form_control = None;
         self.selected_inspection = None;
         self.clamp_scroll();
         self.save_active_tab();
     }
 
     fn load_pending_url<L: ResourceLoader>(&mut self, loader: &L, url: &url::Url, mode: CacheMode) {
+        self.navigation.lifecycle = NavigationLifecycle::LoadingMainResource;
+        self.save_active_tab();
         let pipeline = PagePipeline::new(self.window_width, self.page_viewport_height())
             .with_javascript_enabled(self.javascript_enabled)
             .with_storage(
@@ -1396,15 +2365,44 @@ impl AppState {
                 self.local_storage_entries_for_url(url),
                 self.session_storage_entries_for_url(url),
             );
-        let result = pipeline.load_url_with_cache_and_cookies(
+        let auth_credentials = self.basic_auth_credentials.clone();
+        let result = pipeline.load_navigation_url_with_cache_and_cookies(
             loader,
-            &self.resource_cache,
-            &mut self.cookie_jar,
-            self.cookies_enabled,
+            NavigationLoadContext {
+                cache: CacheTiers {
+                    memory: &self.resource_cache,
+                    disk: self.disk_cache.as_ref(),
+                },
+                cookies: &mut self.cookie_jar,
+                cookies_enabled: self.cookies_enabled,
+                auth_credentials: &auth_credentials,
+            },
             url,
             mode,
         );
-        self.finish_navigation(result);
+        self.navigation.lifecycle = NavigationLifecycle::LoadingSubresources;
+        self.save_active_tab();
+        self.navigation.lifecycle = NavigationLifecycle::ExecutingScripts;
+        self.save_active_tab();
+        match result {
+            Ok(NavigationLoad::Page(page)) => self.finish_navigation(Ok(*page)),
+            Ok(NavigationLoad::Download {
+                response,
+                metadata,
+                diagnostics,
+            }) => self.complete_navigation_download(*response, metadata, diagnostics),
+            Ok(NavigationLoad::AuthenticationRequired {
+                url,
+                challenge,
+                diagnostics,
+            }) => self.set_auth_challenge(url, challenge, diagnostics, false),
+            Ok(NavigationLoad::AuthenticationFailed {
+                url,
+                challenge,
+                diagnostics,
+            }) => self.set_auth_challenge(url, challenge, diagnostics, true),
+            Err(error) => self.finish_navigation(Err(error)),
+        }
         self.apply_loaded_page_browser_actions(loader);
     }
 
@@ -1568,7 +2566,7 @@ impl AppState {
         response: ResourceResponse,
         loader: &L,
     ) -> WebbyResult<RenderedPage> {
-        let html = decode_text_utf8(&response.bytes);
+        let html = decode_text(&response.bytes, response.content_type.as_deref());
         PagePipeline::new(self.window_width, self.page_viewport_height())
             .with_javascript_enabled(self.javascript_enabled)
             .with_storage(
@@ -1867,12 +2865,16 @@ impl AppState {
         let Some(current_url) = &self.navigation.current_url else {
             return;
         };
+        let Some(page_generation) = self.navigation.active_page_generation else {
+            return;
+        };
         self.timers.retain(|timer| timer.id != id);
         self.timers.push(BrowserTimer {
             id,
             callback,
             delay_ms,
             page_url: current_url.to_string(),
+            page_generation,
         });
     }
 
@@ -1893,10 +2895,17 @@ impl AppState {
         else {
             return false;
         };
+        let Some(current_generation) = self.navigation.active_page_generation else {
+            return false;
+        };
         let timers = std::mem::take(&mut self.timers);
         let mut ran = false;
         for timer in timers {
-            if timer.page_url != current_url {
+            if timer.page_url != current_url || timer.page_generation != current_generation {
+                self.navigation.lifecycle_diagnostics.push(format!(
+                    "late timer ignored id={} page_generation={} active_generation={}",
+                    timer.id, timer.page_generation, current_generation
+                ));
                 continue;
             }
             if !self.run_timer(loader, timer) {
@@ -1986,11 +2995,16 @@ impl AppState {
         tab.status = self.status.clone();
         tab.page = self.page.clone();
         tab.scroll_y = self.scroll_y;
+        tab.scroll_offsets = self.scroll_offsets.clone();
         tab.focused_form_control = self.focused_form_control;
+        tab.keyboard_focus = self.keyboard_focus;
         tab.form_values = self.form_values.clone();
         tab.timers = self.timers.clone();
         tab.session_storage = self.session_storage.clone();
         tab.active_transition = self.active_transition.clone();
+        tab.find_query = self.find_query.clone();
+        tab.find_match_count = self.find_match_count;
+        tab.find_active = self.find_active;
     }
 
     fn load_active_tab(&mut self) {
@@ -2002,12 +3016,36 @@ impl AppState {
         self.status = tab.status;
         self.page = tab.page;
         self.scroll_y = tab.scroll_y;
+        self.scroll_offsets = tab.scroll_offsets;
         self.focused_form_control = tab.focused_form_control;
+        self.keyboard_focus = tab.keyboard_focus;
         self.form_values = tab.form_values;
         self.timers = tab.timers;
         self.session_storage = tab.session_storage;
         self.active_transition = tab.active_transition;
+        self.find_query = tab.find_query;
+        self.find_match_count = tab.find_match_count;
+        self.find_active = tab.find_active;
     }
+}
+
+fn apply_nested_scroll_offsets_to_page(
+    page: &mut RenderedPage,
+    offsets: &ScrollOffsets,
+    surface_width: usize,
+) -> WebbyResult<()> {
+    let display_list = build_display_list_with_scroll_offsets(&page.layout, offsets);
+    let surface_height = page.layout.scroll_height.ceil().max(1.0) as usize;
+    page.surface = render_with_backend(
+        &SoftwareRenderBackend,
+        &display_list,
+        surface_width,
+        surface_height,
+    )?;
+    page.links = page.layout.visible_links(offsets);
+    page.form_controls = page.layout.visible_form_controls(offsets);
+    page.display_list = display_list;
+    Ok(())
 }
 
 fn commit_history(
@@ -2221,6 +3259,164 @@ fn focused_control_is_text_editable(page: Option<&RenderedPage>, control_id: usi
     })
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyboardActivation {
+    Enter,
+    Space,
+}
+
+fn compare_focus_rects(left: Rect, right: Rect) -> std::cmp::Ordering {
+    left.y
+        .total_cmp(&right.y)
+        .then_with(|| left.x.total_cmp(&right.x))
+        .then_with(|| left.width.total_cmp(&right.width))
+        .then_with(|| left.height.total_cmp(&right.height))
+}
+
+fn focus_target_key(target: KeyboardFocusTarget) -> (u8, usize) {
+    match target {
+        KeyboardFocusTarget::Link { index } => (0, index),
+        KeyboardFocusTarget::FormControl { id } => (1, id),
+    }
+}
+
+fn focusable_node_order(left: &AccessibleNode, right: &AccessibleNode) -> std::cmp::Ordering {
+    compare_focus_rects(left.rect, right.rect).then_with(|| {
+        let left_key = left
+            .control_id
+            .map(|id| (1, id))
+            .or_else(|| left.href.as_ref().map(|_| (0, 0)))
+            .unwrap_or((2, 0));
+        let right_key = right
+            .control_id
+            .map(|id| (1, id))
+            .or_else(|| right.href.as_ref().map(|_| (0, 0)))
+            .unwrap_or((2, 0));
+        left_key.cmp(&right_key)
+    })
+}
+
+fn accessible_role_for_control(control_type: FormControlType) -> AccessibleRole {
+    match control_type {
+        FormControlType::Text
+        | FormControlType::Search
+        | FormControlType::Password
+        | FormControlType::Email
+        | FormControlType::Textarea
+        | FormControlType::Select => AccessibleRole::Textbox,
+        FormControlType::Checkbox => AccessibleRole::Checkbox,
+        FormControlType::Radio => AccessibleRole::Radio,
+        FormControlType::Submit | FormControlType::Button | FormControlType::Reset => {
+            AccessibleRole::Button
+        }
+    }
+}
+
+fn accessible_name_for_control(
+    page: &RenderedPage,
+    control: &FormControlHitBox,
+    node_id: Option<webby_dom::NodeId>,
+) -> String {
+    if let Some(node_id) = node_id
+        && let Some(node) = page.document.find_node(node_id)
+    {
+        if let Some(name) = element_attribute(node, "aria-label")
+            && !name.trim().is_empty()
+        {
+            return name.to_string();
+        }
+        if let Some(id) = element_attribute(node, "id")
+            && let Some(label) = label_text_for_id(&page.document.root, id)
+            && !label.trim().is_empty()
+        {
+            return label;
+        }
+        if let Some(label) = ancestor_label_text(&page.document.root, node_id)
+            && !label.trim().is_empty()
+        {
+            return label;
+        }
+        if let Some(alt) = element_attribute(node, "alt")
+            && !alt.trim().is_empty()
+        {
+            return alt.to_string();
+        }
+    }
+    control
+        .placeholder
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| control.value.clone())
+}
+
+fn element_attribute<'a>(node: &'a webby_dom::Node, name: &str) -> Option<&'a str> {
+    let webby_dom::NodeKind::Element(element) = &node.kind else {
+        return None;
+    };
+    element.attributes.get(name).map(String::as_str)
+}
+
+fn label_text_for_id(node: &webby_dom::Node, id: &str) -> Option<String> {
+    if let webby_dom::NodeKind::Element(element) = &node.kind
+        && element.tag_name == "label"
+        && element
+            .attributes
+            .get("for")
+            .is_some_and(|candidate| candidate == id)
+    {
+        return Some(node_text_content(node));
+    }
+    node.tree_children()
+        .find_map(|child| label_text_for_id(child, id))
+}
+
+fn ancestor_label_text(node: &webby_dom::Node, target_id: webby_dom::NodeId) -> Option<String> {
+    if let webby_dom::NodeKind::Element(element) = &node.kind
+        && element.tag_name == "label"
+        && node_contains_id(node, target_id)
+    {
+        return Some(node_text_content(node));
+    }
+    node.tree_children()
+        .find_map(|child| ancestor_label_text(child, target_id))
+}
+
+fn node_contains_id(node: &webby_dom::Node, target_id: webby_dom::NodeId) -> bool {
+    node.id == target_id
+        || node
+            .tree_children()
+            .any(|child| node_contains_id(child, target_id))
+}
+
+fn node_text_content(node: &webby_dom::Node) -> String {
+    match &node.kind {
+        webby_dom::NodeKind::Text(text) => text.clone(),
+        webby_dom::NodeKind::Element(element) if element.tag_name == "img" => {
+            element.attributes.get("alt").cloned().unwrap_or_default()
+        }
+        webby_dom::NodeKind::Document | webby_dom::NodeKind::Element(_) => {
+            let mut text = String::new();
+            for child in node.render_children() {
+                text.push_str(&node_text_content(child));
+            }
+            text
+        }
+    }
+}
+
+fn find_match_count(page: Option<&RenderedPage>, query: &str) -> usize {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return 0;
+    }
+    page.map_or(0, |page| {
+        webby_html::extract_visible_text(&page.document)
+            .to_lowercase()
+            .matches(&query)
+            .count()
+    })
+}
+
 fn merge_event_handlers(
     mut existing: Vec<webby_js::EventHandler>,
     mut added: Vec<webby_js::EventHandler>,
@@ -2378,8 +3574,7 @@ fn collect_dom_path(node: &webby_dom::Node, target_node_id: u64, path: &mut Vec<
         return true;
     }
     if node
-        .children
-        .iter()
+        .tree_children()
         .any(|child| collect_dom_path(child, target_node_id, path))
     {
         return true;
@@ -2398,8 +3593,7 @@ fn find_link_node_id(node: &webby_dom::Node, href: &str) -> Option<u64> {
     {
         return Some(node.id);
     }
-    node.children
-        .iter()
+    node.tree_children()
         .find_map(|child| find_link_node_id(child, href))
 }
 
@@ -2414,7 +3608,10 @@ fn find_form_control_node_id_inner(
     index: &mut usize,
 ) -> Option<u64> {
     if let webby_dom::NodeKind::Element(element) = &node.kind
-        && matches!(element.tag_name.as_str(), "input" | "button")
+        && matches!(
+            element.tag_name.as_str(),
+            "input" | "button" | "select" | "textarea"
+        )
     {
         let current = *index;
         *index = index.saturating_add(1);
@@ -2422,8 +3619,7 @@ fn find_form_control_node_id_inner(
             return Some(node.id);
         }
     }
-    node.children
-        .iter()
+    node.tree_children()
         .find_map(|child| find_form_control_node_id_inner(child, control_id, index))
 }
 
@@ -2446,8 +3642,7 @@ fn find_form_node_id_inner(
             return Some(node.id);
         }
     }
-    node.children
-        .iter()
+    node.tree_children()
         .find_map(|child| find_form_node_id_inner(child, form_id, index))
 }
 
@@ -2462,6 +3657,7 @@ impl Default for AppState {
 pub struct PagePipeline {
     viewport_width: usize,
     viewport_height: usize,
+    render_backend: SoftwareRenderBackend,
     javascript_enabled: bool,
     storage_enabled: bool,
     local_storage: Vec<webby_js::StorageEntry>,
@@ -2474,6 +3670,7 @@ struct CookiePipelineLoader<'a, L> {
     loader: &'a L,
     cookies: RefCell<&'a mut CookieJar>,
     cookies_enabled: bool,
+    auth_credentials: &'a BTreeMap<String, BasicCredentials>,
     diagnostics: RefCell<Vec<String>>,
 }
 
@@ -2510,6 +3707,80 @@ struct LoadedIframes {
     diagnostics: Vec<String>,
 }
 
+struct NavigationLoadContext<'a> {
+    cache: CacheTiers<'a>,
+    cookies: &'a mut CookieJar,
+    cookies_enabled: bool,
+    auth_credentials: &'a BTreeMap<String, BasicCredentials>,
+}
+
+enum NavigationLoad {
+    Page(Box<RenderedPage>),
+    Download {
+        response: Box<ResourceResponse>,
+        metadata: DownloadMetadata,
+        diagnostics: Vec<String>,
+    },
+    AuthenticationRequired {
+        url: url::Url,
+        challenge: BasicAuthChallenge,
+        diagnostics: Vec<String>,
+    },
+    AuthenticationFailed {
+        url: url::Url,
+        challenge: BasicAuthChallenge,
+        diagnostics: Vec<String>,
+    },
+}
+
+fn decode_html_response(response: &ResourceResponse) -> WebbyResult<String> {
+    match response.navigation_disposition() {
+        NavigationResponseDisposition::RenderHtml => Ok(decode_text(
+            &response.bytes,
+            response.content_type.as_deref(),
+        )),
+        NavigationResponseDisposition::Download(metadata) => Err(WebbyError::unsupported(format!(
+            "top-level response {} must be downloaded: {}",
+            response.final_url, metadata.reason
+        ))),
+    }
+}
+
+fn request_headers_with_auth(
+    mut headers: Vec<(String, String)>,
+    url: &url::Url,
+    credentials: &BTreeMap<String, BasicCredentials>,
+) -> Vec<(String, String)> {
+    if let Ok(origin) = webby_security::origin_key(url)
+        && let Some(credentials) = credentials.get(&origin)
+        && !headers
+            .iter()
+            .any(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+    {
+        headers.push(basic_auth_header(credentials));
+    }
+    headers
+}
+
+fn request_has_authorization(headers: &[(String, String)]) -> bool {
+    headers
+        .iter()
+        .any(|(name, _)| name.eq_ignore_ascii_case("authorization"))
+}
+
+fn auth_response_diagnostics(
+    mut diagnostics: Vec<String>,
+    response: &ResourceResponse,
+    request_headers: &[(String, String)],
+) -> Vec<String> {
+    diagnostics.push(format!(
+        "authentication diagnostic: challenge url={} request_headers={:?}",
+        response.final_url,
+        webby_net::redact_request_headers(request_headers)
+    ));
+    diagnostics
+}
+
 impl<L: ResourceLoader> CookiePipelineLoader<'_, L> {
     fn take_diagnostics(&self) -> Vec<String> {
         std::mem::take(&mut *self.diagnostics.borrow_mut())
@@ -2523,6 +3794,7 @@ impl<L: ResourceLoader> ResourceLoader for CookiePipelineLoader<'_, L> {
         } else {
             Vec::new()
         };
+        let headers = request_headers_with_auth(headers, url, self.auth_credentials);
         let response = self.loader.load_with_headers(url, &headers)?;
         if self.cookies_enabled {
             self.diagnostics.borrow_mut().extend(
@@ -2545,6 +3817,7 @@ impl<L: ResourceLoader> ResourceLoader for CookiePipelineLoader<'_, L> {
         } else {
             Vec::new()
         };
+        request_headers = request_headers_with_auth(request_headers, url, self.auth_credentials);
         request_headers.extend(headers.iter().cloned());
         let response = self
             .loader
@@ -2566,6 +3839,7 @@ impl PagePipeline {
         Self {
             viewport_width: viewport_width.max(1),
             viewport_height: viewport_height.max(1),
+            render_backend: SoftwareRenderBackend,
             javascript_enabled: true,
             storage_enabled: true,
             local_storage: Vec::new(),
@@ -2600,6 +3874,11 @@ impl PagePipeline {
         self
     }
 
+    /// Returns the deterministic renderer backend used by this pipeline.
+    pub fn render_backend_name(&self) -> &'static str {
+        self.render_backend.name()
+    }
+
     fn with_iframe_depth(mut self, depth: usize) -> Self {
         self.iframe_depth = depth;
         self
@@ -2612,7 +3891,7 @@ impl PagePipeline {
         url: &url::Url,
     ) -> WebbyResult<RenderedPage> {
         let response = loader.load(url)?;
-        let html = decode_text_utf8(&response.bytes);
+        let html = decode_html_response(&response)?;
         self.render_html_with_loader(&html, response.final_url, loader)
     }
 
@@ -2626,7 +3905,7 @@ impl PagePipeline {
     ) -> WebbyResult<RenderedPage> {
         let cached_loader = webby_cache::CachedResourceLoader::new(loader, cache);
         let response = cached_loader.load_with_mode(url, mode)?;
-        let html = decode_text_utf8(&response.bytes);
+        let html = decode_html_response(&response)?;
         let mut page =
             self.render_html_with_loader(&html, response.final_url.clone(), &cached_loader)?;
         let cache_diagnostics = cached_loader
@@ -2641,13 +3920,16 @@ impl PagePipeline {
     pub fn load_url_with_cache_and_cookies<L: ResourceLoader>(
         &self,
         loader: &L,
-        cache: &ResourceCache,
+        cache: CacheTiers<'_>,
         cookies: &mut CookieJar,
         cookies_enabled: bool,
         url: &url::Url,
         mode: CacheMode,
     ) -> WebbyResult<RenderedPage> {
-        let cached_loader = webby_cache::CachedResourceLoader::new(loader, cache);
+        let mut cached_loader = webby_cache::CachedResourceLoader::new(loader, cache.memory);
+        if let Some(disk_cache) = cache.disk {
+            cached_loader = cached_loader.with_disk_cache(disk_cache);
+        }
         let headers = if cookies_enabled {
             cookies.request_headers(url)
         } else {
@@ -2659,11 +3941,13 @@ impl PagePipeline {
         } else {
             Vec::new()
         };
-        let html = decode_text_utf8(&response.bytes);
+        let html = decode_html_response(&response)?;
+        let empty_auth = BTreeMap::new();
         let cookie_loader = CookiePipelineLoader {
             loader: &cached_loader,
             cookies: RefCell::new(cookies),
             cookies_enabled,
+            auth_credentials: &empty_auth,
             diagnostics: RefCell::new(Vec::new()),
         };
         let mut page =
@@ -2677,6 +3961,88 @@ impl PagePipeline {
         diagnostics.extend(cookie_loader.take_diagnostics());
         page.diagnostics.splice(0..0, diagnostics);
         Ok(page)
+    }
+
+    fn load_navigation_url_with_cache_and_cookies<L: ResourceLoader>(
+        &self,
+        loader: &L,
+        context: NavigationLoadContext<'_>,
+        url: &url::Url,
+        mode: CacheMode,
+    ) -> WebbyResult<NavigationLoad> {
+        let mut cached_loader =
+            webby_cache::CachedResourceLoader::new(loader, context.cache.memory);
+        if let Some(disk_cache) = context.cache.disk {
+            cached_loader = cached_loader.with_disk_cache(disk_cache);
+        }
+        let headers = if context.cookies_enabled {
+            context.cookies.request_headers(url)
+        } else {
+            Vec::new()
+        };
+        let headers = request_headers_with_auth(headers, url, context.auth_credentials);
+        let mode = if request_has_authorization(&headers) {
+            CacheMode::Refresh
+        } else {
+            mode
+        };
+        let response = cached_loader.load_with_headers_and_mode(url, &headers, mode)?;
+        let mut diagnostics = cached_loader
+            .take_diagnostics()
+            .into_iter()
+            .map(|diagnostic| diagnostic.format())
+            .collect::<Vec<_>>();
+        if context.cookies_enabled {
+            diagnostics.extend(
+                context
+                    .cookies
+                    .store_from_headers(&response.final_url, &response.headers),
+            );
+        }
+        if let Some(challenge) = response.basic_auth_challenge() {
+            let diagnostics = auth_response_diagnostics(diagnostics, &response, &headers);
+            return if request_has_authorization(&headers) {
+                Ok(NavigationLoad::AuthenticationFailed {
+                    url: response.final_url.clone(),
+                    challenge,
+                    diagnostics,
+                })
+            } else {
+                Ok(NavigationLoad::AuthenticationRequired {
+                    url: response.final_url.clone(),
+                    challenge,
+                    diagnostics,
+                })
+            };
+        }
+        match response.navigation_disposition() {
+            NavigationResponseDisposition::RenderHtml => {
+                let html = decode_text(&response.bytes, response.content_type.as_deref());
+                let cookie_loader = CookiePipelineLoader {
+                    loader: &cached_loader,
+                    cookies: RefCell::new(context.cookies),
+                    cookies_enabled: context.cookies_enabled,
+                    auth_credentials: context.auth_credentials,
+                    diagnostics: RefCell::new(Vec::new()),
+                };
+                let mut page =
+                    self.render_html_with_loader(&html, response.final_url, &cookie_loader)?;
+                diagnostics.extend(
+                    cached_loader
+                        .take_diagnostics()
+                        .into_iter()
+                        .map(|diagnostic| diagnostic.format()),
+                );
+                diagnostics.extend(cookie_loader.take_diagnostics());
+                page.diagnostics.splice(0..0, diagnostics);
+                Ok(NavigationLoad::Page(Box::new(page)))
+            }
+            NavigationResponseDisposition::Download(metadata) => Ok(NavigationLoad::Download {
+                response: Box::new(response),
+                metadata,
+                diagnostics,
+            }),
+        }
     }
 
     /// Parses, styles, lays out, display-lists, and renders an HTML string.
@@ -2697,8 +4063,14 @@ impl PagePipeline {
         url: url::Url,
         loader: &L,
     ) -> WebbyResult<RenderedPage> {
-        let document = webby_html::parse_document(html)?;
-        let mut diagnostics = collect_security_diagnostics(&document, &url);
+        let parsed = webby_html::parse_document_with_diagnostics(html)?;
+        let document = parsed.document;
+        let mut diagnostics = parsed
+            .diagnostics
+            .into_iter()
+            .map(|diagnostic| diagnostic.to_string())
+            .collect::<Vec<_>>();
+        diagnostics.extend(collect_security_diagnostics(&document, &url));
         let decoded = webby_image::load_images(&document, &url, loader);
         let mut images = webby_image::to_layout_image_map(&decoded);
         let iframe_load = self.load_iframe_pages(&document, &url, loader);
@@ -2779,7 +4151,7 @@ impl PagePipeline {
         iframe: &webby_html::IframeElement,
     ) -> WebbyResult<RenderedPage> {
         let response = loader.load(target)?;
-        let html = decode_text_utf8(&response.bytes);
+        let html = decode_text(&response.bytes, response.content_type.as_deref());
         let (width, height) = iframe_viewport_size(iframe);
         PagePipeline::new(width, height)
             .with_javascript_enabled(self.javascript_enabled)
@@ -2794,8 +4166,14 @@ impl PagePipeline {
         url: url::Url,
         images: &ImageMap,
     ) -> WebbyResult<RenderedPage> {
-        let document = webby_html::parse_document(html)?;
-        let diagnostics = collect_security_diagnostics(&document, &url);
+        let parsed = webby_html::parse_document_with_diagnostics(html)?;
+        let document = parsed.document;
+        let mut diagnostics = parsed
+            .diagnostics
+            .into_iter()
+            .map(|diagnostic| diagnostic.to_string())
+            .collect::<Vec<_>>();
+        diagnostics.extend(collect_security_diagnostics(&document, &url));
         let loaded_scripts = webby_script::load_document_scripts::<webby_net::DefaultResourceLoader>(
             &document, &url, None,
         );
@@ -2874,6 +4252,7 @@ impl PagePipeline {
             dirty,
         } = input;
         let stylesheet = webby_style::compose_document_stylesheet(&document, &external_stylesheets);
+        append_unique_diagnostics(&mut diagnostics, large_document_diagnostics(&document));
         diagnostics.extend(stylesheet.diagnostics.iter().map(|diagnostic| {
             format!(
                 "CSS diagnostic at byte {}: {}",
@@ -2892,12 +4271,22 @@ impl PagePipeline {
         let display_list = build_display_list(&layout);
         let surface_height = layout.scroll_height.ceil().max(1.0) as usize;
         let content_height = layout.scroll_height;
-        let links = layout.links.clone();
-        let form_controls = layout.form_controls.clone();
-        let surface = render_to_surface(&display_list, self.viewport_width, surface_height)?;
+        let links = layout.visible_links(&ScrollOffsets::new());
+        let form_controls = layout.visible_form_controls(&ScrollOffsets::new());
+        let surface = render_with_backend(
+            &self.render_backend,
+            &display_list,
+            self.viewport_width,
+            surface_height,
+        )?;
 
         Ok(RenderedPage {
             url,
+            title: webby_html::extract_document_title(&document),
+            favicon_href: webby_html::collect_icon_links(&document)
+                .into_iter()
+                .next()
+                .map(|icon| icon.href),
             document,
             event_handlers,
             images,
@@ -2915,6 +4304,35 @@ impl PagePipeline {
             dirty,
             transition,
         })
+    }
+}
+
+fn large_document_diagnostics(document: &webby_dom::Document) -> Vec<String> {
+    let count = count_dom_nodes(&document.root);
+    if count <= LARGE_DOCUMENT_NODE_DIAGNOSTIC_THRESHOLD {
+        return Vec::new();
+    }
+    vec![format!(
+        "performance diagnostic: document has {count} DOM nodes; advisory threshold is {LARGE_DOCUMENT_NODE_DIAGNOSTIC_THRESHOLD}"
+    )]
+}
+
+fn count_dom_nodes(node: &webby_dom::Node) -> usize {
+    let mut count = 0_usize;
+    let mut pending = vec![node];
+    while let Some(current) = pending.pop() {
+        count = count.saturating_add(1);
+        pending.extend(current.children.iter());
+        pending.extend(current.shadow_children.iter());
+    }
+    count
+}
+
+fn append_unique_diagnostics(target: &mut Vec<String>, diagnostics: Vec<String>) {
+    for diagnostic in diagnostics {
+        if !target.contains(&diagnostic) {
+            target.push(diagnostic);
+        }
     }
 }
 
@@ -3118,7 +4536,7 @@ fn preload_one_javascript_resource<L: ResourceLoader>(
         request_url: request.to_string(),
         url: response.final_url.to_string(),
         status,
-        body: decode_text_utf8(&response.bytes),
+        body: decode_text(&response.bytes, response.content_type.as_deref()),
         error: None,
     })
 }
@@ -3460,10 +4878,18 @@ fn draw_tab_strip(surface: &mut Surface, state: &AppState) {
         );
         stroke_rect(surface, x, 0, width, TAB_STRIP_HEIGHT, [150, 156, 166, 255]);
         if width >= 32 {
+            let label = state
+                .tabs
+                .get(index)
+                .and_then(|tab| tab.page.as_ref())
+                .map(|page| page.title.as_str())
+                .filter(|title| !title.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| format!("{}", index + 1));
             surface.draw_text(
                 (x + 6) as f32,
                 3.0,
-                &format!("{}", index + 1),
+                &label,
                 10.0,
                 FontWeight::Normal,
                 Color {
@@ -3557,6 +4983,116 @@ fn draw_chrome_status(surface: &mut Surface, state: &AppState) {
         FontWeight::Normal,
         color,
     );
+    if state
+        .page
+        .as_ref()
+        .and_then(|page| page.favicon_href.as_ref())
+        .is_some()
+    {
+        surface.draw_text(
+            ADDRESS_X.saturating_add(48) as f32,
+            3.0,
+            "icon",
+            10.0,
+            FontWeight::Normal,
+            color,
+        );
+    }
+}
+
+fn draw_shell_overlay(surface: &mut Surface, state: &AppState) {
+    let status = state.status_bar_text();
+    let y = surface.height.saturating_sub(16);
+    fill_rect(surface, 0, y, surface.width, 16, [242, 244, 247, 255]);
+    surface.draw_text(
+        6.0,
+        y.saturating_add(3) as f32,
+        &status,
+        10.0,
+        FontWeight::Normal,
+        Color {
+            r: 55,
+            g: 62,
+            b: 72,
+            a: 255,
+        },
+    );
+    if state.find_active {
+        draw_find_panel(surface, state);
+    }
+    if state.shortcut_help_visible {
+        draw_shortcut_help(surface);
+    }
+}
+
+fn draw_find_panel(surface: &mut Surface, state: &AppState) {
+    let width = 260.min(surface.width);
+    fill_rect(surface, 0, CHROME_HEIGHT, width, 24, [255, 252, 225, 255]);
+    stroke_rect(surface, 0, CHROME_HEIGHT, width, 24, [170, 156, 98, 255]);
+    surface.draw_text(
+        6.0,
+        (CHROME_HEIGHT + 6) as f32,
+        &format!(
+            "Find: {} ({} matches)",
+            state.find_query, state.find_match_count
+        ),
+        11.0,
+        FontWeight::Normal,
+        Color {
+            r: 55,
+            g: 48,
+            b: 24,
+            a: 255,
+        },
+    );
+}
+
+fn draw_shortcut_help(surface: &mut Surface) {
+    let width = 350.min(surface.width);
+    let height = 92.min(surface.height.saturating_sub(CHROME_HEIGHT));
+    fill_rect(
+        surface,
+        8,
+        CHROME_HEIGHT + 8,
+        width,
+        height,
+        [250, 251, 253, 255],
+    );
+    stroke_rect(
+        surface,
+        8,
+        CHROME_HEIGHT + 8,
+        width,
+        height,
+        [120, 128, 138, 255],
+    );
+    for (index, line) in [
+        "Shortcuts",
+        "Ctrl+L address  Ctrl+A select all  Ctrl+C/V copy/paste",
+        "Ctrl+F find  Ctrl+O open local path  Ctrl+R reload",
+        "Ctrl+T/W tabs  Alt+Left/Right history  F1 help  F12 inspect",
+    ]
+    .iter()
+    .enumerate()
+    {
+        surface.draw_text(
+            16.0,
+            (CHROME_HEIGHT + 16 + index * 18) as f32,
+            line,
+            10.0,
+            if index == 0 {
+                FontWeight::Bold
+            } else {
+                FontWeight::Normal
+            },
+            Color {
+                r: 38,
+                g: 44,
+                b: 52,
+                a: 255,
+            },
+        );
+    }
 }
 
 fn draw_status_message(surface: &mut Surface, label: &str, detail: &str) {
@@ -3786,7 +5322,7 @@ fn render_transition_surface(
     height: usize,
 ) -> WebbyResult<Surface> {
     let list = interpolated_display_list(transition);
-    render_to_surface(&list, width, height)
+    render_with_backend(&SoftwareRenderBackend, &list, width, height)
 }
 
 fn interpolated_display_list(transition: &ActiveTransition) -> DisplayList {
@@ -4016,6 +5552,28 @@ fn draw_form_value_overlays(
     }
 }
 
+fn draw_keyboard_focus_ring(
+    surface: &mut Surface,
+    page: &RenderedPage,
+    focus: Option<KeyboardFocusTarget>,
+    scroll_y: f32,
+) {
+    let Some(focus) = focus else {
+        return;
+    };
+    let rect = match focus {
+        KeyboardFocusTarget::Link { index } => page.links.get(index).map(|link| link.rect),
+        KeyboardFocusTarget::FormControl { id } => page
+            .form_controls
+            .iter()
+            .find(|control| control.id == id)
+            .map(|control| control.rect),
+    };
+    if let Some(rect) = rect {
+        stroke_page_rect(surface, rect, scroll_y, [255, 180, 0, 255]);
+    }
+}
+
 fn fill_rect(
     surface: &mut Surface,
     x: usize,
@@ -4078,6 +5636,59 @@ fn put_pixel(surface: &mut Surface, x: usize, y: usize, color: [u8; 4]) {
     surface.pixels[index..index + 4].copy_from_slice(&color);
 }
 
+fn default_download_directory() -> std::path::PathBuf {
+    std::env::temp_dir().join("webby-downloads")
+}
+
+fn sanitize_download_filename(filename: &str) -> String {
+    let sanitized = filename
+        .chars()
+        .map(|character| {
+            if character.is_control()
+                || matches!(
+                    character,
+                    '/' | '\\' | ':' | '*' | '?' | '"' | '<' | '>' | '|'
+                )
+            {
+                '_'
+            } else {
+                character
+            }
+        })
+        .collect::<String>();
+    let sanitized = sanitized.trim().trim_matches('.').trim();
+    if sanitized.is_empty() {
+        "download".to_string()
+    } else {
+        sanitized.to_string()
+    }
+}
+
+fn unique_download_destination(directory: &std::path::Path, filename: &str) -> std::path::PathBuf {
+    let direct = directory.join(filename);
+    if !direct.exists() {
+        return direct;
+    }
+    let path = std::path::Path::new(filename);
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .filter(|stem| !stem.is_empty())
+        .unwrap_or("download");
+    let extension = path.extension().and_then(|extension| extension.to_str());
+    for suffix in 2..=usize::MAX {
+        let candidate = match extension {
+            Some(extension) if !extension.is_empty() => format!("{stem}-{suffix}.{extension}"),
+            _ => format!("{stem}-{suffix}"),
+        };
+        let destination = directory.join(candidate);
+        if !destination.exists() {
+            return destination;
+        }
+    }
+    directory.join("download")
+}
+
 /// Creates the documented startup URL for tests and app startup.
 pub fn startup_file_url() -> WebbyResult<url::Url> {
     let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -4136,10 +5747,11 @@ impl ResourceLoader for StaticHtmlLoader {
 #[cfg(test)]
 mod tests {
     use super::{
-        ADDRESS_X, ADDRESS_Y, ActiveTransition, AppState, BOOKMARKS_PAGE_URL, CHROME_BUTTON_Y,
-        CHROME_HEIGHT, ChromeAction, Dimensions, HoverTarget, InspectionInfo, LayoutBox,
-        PagePipeline, PageStatus, Rect, RenderedPage, STARTUP_ADDRESS, StaticHtmlLoader, Surface,
-        build_display_list, startup_file_url, tag_name_for_kind,
+        ADDRESS_X, ADDRESS_Y, AccessibleRole, ActiveTransition, AppState, BOOKMARKS_PAGE_URL,
+        BrowserChrome, CHROME_BUTTON_Y, CHROME_HEIGHT, ChromeAction, Dimensions, HoverTarget,
+        InspectionInfo, KeyboardFocusTarget, LayoutBox, NavigationLifecycle, PagePipeline,
+        PageStatus, PendingHistoryAction, Rect, RenderedPage, STARTUP_ADDRESS, StaticHtmlLoader,
+        Surface, build_display_list, startup_file_url, tag_name_for_kind,
     };
     use base64::Engine;
     use image::{ImageBuffer, ImageFormat, Rgba};
@@ -4155,6 +5767,334 @@ mod tests {
         assert_eq!(state.chrome.address_input, STARTUP_ADDRESS);
         assert!(state.chrome.address_focused);
         assert_eq!(state.status, PageStatus::Startup);
+    }
+
+    #[test]
+    fn address_cursor_editing_is_unicode_safe() {
+        let mut chrome = BrowserChrome::new();
+        chrome.set_address_input("ab");
+        chrome.move_cursor_left();
+        chrome.type_character('å');
+        assert_eq!(chrome.address_input, "aåb");
+
+        chrome.backspace();
+        assert_eq!(chrome.address_input, "ab");
+        chrome.move_cursor_home();
+        chrome.type_character('x');
+        chrome.move_cursor_end();
+        chrome.type_character('y');
+        assert_eq!(chrome.address_input, "xaby");
+
+        chrome.set_address_input("åb");
+        chrome.address_cursor = 1;
+        chrome.type_character('x');
+        assert_eq!(chrome.address_input, "xåb");
+        chrome.address_cursor = usize::MAX;
+        chrome.paste("z");
+        assert_eq!(chrome.address_input, "xåbz");
+    }
+
+    #[test]
+    fn app_local_clipboard_copies_selection_or_current_url_and_pastes() -> WebbyResult<()> {
+        let mut state = AppState::new();
+        state.chrome.set_address_input("example.test");
+        state.select_all_address();
+        assert!(state.copy_address_or_current_url());
+        assert_eq!(state.clipboard, "example.test");
+
+        state.chrome.set_address_input("https://");
+        state.clipboard = "webby.test".to_string();
+        assert!(state.paste_address());
+        assert_eq!(state.chrome.address_input, "https://webby.test");
+
+        state.chrome.address_selected = false;
+        state.navigation.current_url =
+            Some(url::Url::parse("https://current.test/").map_err(url_error)?);
+        assert!(state.copy_address_or_current_url());
+        assert_eq!(state.clipboard, "https://current.test/");
+        Ok(())
+    }
+
+    #[test]
+    fn find_in_page_counts_visible_text_and_stays_per_tab() -> WebbyResult<()> {
+        let base = url::Url::parse("https://example.test/").map_err(url_error)?;
+        let page = PagePipeline::new(240, 120).render_html(
+            "<title>Find page</title><body><p>Webby visible webby</p><script>var x = 'webby';</script></body>",
+            base,
+        )?;
+        let mut state = AppState::with_window_size(240, 160);
+        state.finish_navigation(Ok(page));
+        state.open_find();
+        for character in "webby".chars() {
+            state.type_character(character);
+        }
+
+        assert_eq!(state.find_match_count, 2);
+        assert!(state.find_active);
+        state.new_tab();
+        assert_eq!(state.find_query, "");
+        assert_eq!(state.find_match_count, 0);
+        assert!(!state.find_active);
+        assert!(state.switch_tab(0));
+        assert_eq!(state.find_query, "webby");
+        assert_eq!(state.find_match_count, 2);
+        assert!(state.find_active);
+        state.validate_active_tab_sync()?;
+        Ok(())
+    }
+
+    #[test]
+    fn page_title_favicon_and_hover_status_are_exposed_by_shell_state() -> WebbyResult<()> {
+        let base = url::Url::parse("https://example.test/").map_err(url_error)?;
+        let page = PagePipeline::new(240, 120).render_html(
+            "<head><title>Webby Page</title><link rel=\"icon\" href=\"favicon.ico\"></head><body><a href=\"/docs\">Docs</a></body>",
+            base,
+        )?;
+        let mut state = AppState::with_window_size(240, 160);
+        state.finish_navigation(Ok(page));
+
+        assert_eq!(state.window_title(), "Webby Page");
+        assert_eq!(
+            state
+                .page
+                .as_ref()
+                .and_then(|page| page.favicon_href.as_deref()),
+            Some("favicon.ico")
+        );
+        let (x, y) = first_link_point(&state)?;
+        state.update_hover_at(x, y + CHROME_HEIGHT as f32);
+        assert_eq!(state.status_bar_text(), "/docs");
+        Ok(())
+    }
+
+    #[test]
+    fn open_file_and_download_resource_are_deterministic_shell_operations() -> WebbyResult<()> {
+        let mut state = AppState::with_window_size(240, 160);
+        let loader = webby_net::DefaultResourceLoader::new()?;
+        let startup = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../..")
+            .join(STARTUP_ADDRESS);
+        assert!(state.open_file(&loader, &startup));
+        assert!(matches!(state.status, PageStatus::Loaded { .. }));
+
+        let download_url = url::Url::parse("https://example.test/download").map_err(url_error)?;
+        let download_loader = StaticHtmlLoader::new("download bytes", download_url.clone());
+        let destination =
+            std::env::temp_dir().join(format!("webby-download-{}.txt", std::process::id()));
+        let record = state.download_resource(&download_loader, &download_url, &destination)?;
+        let bytes = std::fs::read(&destination).map_err(|source| WebbyError::Io {
+            path: Some(destination.clone()),
+            source,
+        })?;
+        let _ = std::fs::remove_file(&destination);
+
+        assert_eq!(bytes, b"download bytes");
+        assert_eq!(record.url, download_url);
+        assert_eq!(record.byte_len, bytes.len());
+        assert_eq!(state.downloads, vec![record]);
+        Ok(())
+    }
+
+    #[test]
+    fn unsupported_navigation_downloads_safely_without_committing_history() -> WebbyResult<()> {
+        let home = url::Url::parse("https://example.test/").map_err(url_error)?;
+        let download_url = url::Url::parse("https://example.test/export").map_err(url_error)?;
+        let mut state = AppState::with_window_size(240, 160);
+        state.navigate_to_url(
+            &StaticHtmlLoader::new("<body>home</body>", home.clone()),
+            home.clone(),
+        );
+        let history = state.navigation.history.clone();
+        let directory = temp_download_dir("navigation");
+        let _ = std::fs::remove_dir_all(&directory);
+        state.set_download_directory(&directory);
+        let loader = DownloadResponseLoader::new(
+            download_url.clone(),
+            "application/pdf",
+            vec![(
+                "content-disposition".to_string(),
+                "attachment; filename=\"../secret?.pdf\"".to_string(),
+            )],
+            b"%PDF".to_vec(),
+        );
+
+        state.navigate_to_url(&loader, download_url.clone());
+        state.navigate_to_url(&loader, download_url);
+
+        assert_eq!(state.navigation.current_url.as_ref(), Some(&home));
+        assert_eq!(state.navigation.history, history);
+        assert!(state.navigation.pending_url.is_none());
+        assert!(matches!(state.status, PageStatus::Loaded { .. }));
+        assert_eq!(state.downloads.len(), 2);
+        assert_eq!(state.downloads[0].filename, "_secret_.pdf");
+        assert_eq!(state.downloads[1].filename, "_secret_-2.pdf");
+        assert_eq!(
+            std::fs::read(&state.downloads[0].destination).map_err(|source| {
+                WebbyError::Io {
+                    path: Some(state.downloads[0].destination.clone()),
+                    source,
+                }
+            })?,
+            b"%PDF"
+        );
+        assert!(
+            state
+                .download_diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains("download complete"))
+        );
+        let _ = std::fs::remove_dir_all(directory);
+        Ok(())
+    }
+
+    #[test]
+    fn basic_auth_challenge_becomes_visible_error_without_credentials() -> WebbyResult<()> {
+        let url = url::Url::parse("https://example.test/private").map_err(url_error)?;
+        let loader = BasicAuthLoader::new(url.clone(), "webby", "secret");
+        let mut state = AppState::with_window_size(240, 160);
+
+        state.navigate_to_url(&loader, url.clone());
+
+        assert!(matches!(state.status, PageStatus::Error { .. }));
+        assert_eq!(state.navigation.failed_url.as_deref(), Some(url.as_str()));
+        let challenge = state
+            .auth_challenge
+            .as_ref()
+            .ok_or_else(|| WebbyError::invalid_input("missing auth challenge"))?;
+        assert_eq!(challenge.origin, "https://example.test:443");
+        assert_eq!(challenge.challenge.realm.as_deref(), Some("Members"));
+        assert!(state.auth_diagnostics.iter().any(|diagnostic| {
+            diagnostic.contains("HTTP Basic authentication required")
+                && !diagnostic.contains("secret")
+        }));
+        assert!(state.navigation.history.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn basic_auth_credentials_load_page_and_are_not_persisted() -> WebbyResult<()> {
+        let url = url::Url::parse("https://example.test/private").map_err(url_error)?;
+        let loader = BasicAuthLoader::new(url.clone(), "webby", "secret");
+        let mut state = AppState::with_window_size(240, 160);
+
+        state.set_basic_auth_credentials(&url, "webby", "secret")?;
+        state.navigate_to_url(&loader, url.clone());
+
+        assert!(matches!(state.status, PageStatus::Loaded { .. }));
+        assert_eq!(state.navigation.current_url.as_ref(), Some(&url));
+        assert_eq!(state.navigation.history, vec![url.clone()]);
+        assert!(state.auth_challenge.is_none());
+        assert_eq!(loader.authorized_calls.get(), 1);
+
+        let fresh = AppState::with_window_size(240, 160);
+        assert!(fresh.basic_auth_credentials.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn wrong_basic_auth_credentials_fail_gracefully_and_are_redacted() -> WebbyResult<()> {
+        let url = url::Url::parse("https://example.test/private").map_err(url_error)?;
+        let loader = BasicAuthLoader::new(url.clone(), "webby", "secret");
+        let mut state = AppState::with_window_size(240, 160);
+
+        state.set_basic_auth_credentials(&url, "webby", "wrong-password")?;
+        state.navigate_to_url(&loader, url.clone());
+
+        assert!(matches!(
+            state.status,
+            PageStatus::Error { ref message } if message.contains("authentication failed")
+        ));
+        assert_eq!(state.navigation.failed_url.as_deref(), Some(url.as_str()));
+        assert!(state.navigation.history.is_empty());
+        let diagnostics = format!("{:?}", state.auth_diagnostics);
+        assert!(diagnostics.contains("<redacted>"));
+        assert!(!diagnostics.contains("wrong-password"));
+        assert!(!diagnostics.contains("secret"));
+        Ok(())
+    }
+
+    #[test]
+    fn basic_auth_navigation_refreshes_past_cached_challenge() -> WebbyResult<()> {
+        let url = url::Url::parse("https://example.test/private").map_err(url_error)?;
+        let loader = BasicAuthLoader::new(url.clone(), "webby", "secret");
+        let mut state = AppState::with_window_size(240, 160);
+
+        state.navigate_to_url(&loader, url.clone());
+        assert!(matches!(state.status, PageStatus::Error { .. }));
+        state.set_basic_auth_credentials(&url, "webby", "secret")?;
+        state.navigate_to_url(&loader, url.clone());
+
+        assert!(matches!(state.status, PageStatus::Loaded { .. }));
+        assert_eq!(loader.authorized_calls.get(), 1);
+        assert!(
+            state
+                .page
+                .as_ref()
+                .map(|page| webby_html::extract_visible_text(&page.document).contains("Private"))
+                .unwrap_or(false)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn failed_navigation_download_is_structured_app_error() -> WebbyResult<()> {
+        let download_url =
+            url::Url::parse("https://example.test/archive.bin").map_err(url_error)?;
+        let destination_root = temp_download_dir("blocked");
+        let _ = std::fs::remove_file(&destination_root);
+        let _ = std::fs::remove_dir_all(&destination_root);
+        std::fs::write(&destination_root, b"not a directory").map_err(|source| WebbyError::Io {
+            path: Some(destination_root.clone()),
+            source,
+        })?;
+        let mut state = AppState::with_window_size(240, 160);
+        state.set_download_directory(&destination_root);
+        let loader = DownloadResponseLoader::new(
+            download_url.clone(),
+            "application/octet-stream",
+            Vec::new(),
+            b"bytes".to_vec(),
+        );
+
+        state.navigate_to_url(&loader, download_url.clone());
+
+        assert!(matches!(state.status, PageStatus::Error { .. }));
+        assert_eq!(
+            state.navigation.failed_url.as_deref(),
+            Some(download_url.as_str())
+        );
+        assert!(state.navigation.history.is_empty());
+        assert!(state.downloads.is_empty());
+        let _ = std::fs::remove_file(destination_root);
+        Ok(())
+    }
+
+    #[test]
+    fn page_pipeline_rejects_unsupported_binary_top_level_response() -> WebbyResult<()> {
+        let url = url::Url::parse("https://example.test/archive.bin").map_err(url_error)?;
+        let loader = DownloadResponseLoader::new(
+            url.clone(),
+            "application/octet-stream",
+            Vec::new(),
+            b"bytes".to_vec(),
+        );
+
+        let result = PagePipeline::new(240, 160).load_url(&loader, &url);
+
+        assert!(matches!(result, Err(WebbyError::Unsupported { .. })));
+        Ok(())
+    }
+
+    #[test]
+    fn shortcut_help_toggle_changes_composed_shell_pixels() -> WebbyResult<()> {
+        let mut state = AppState::with_window_size(420, 220);
+        let normal = state.compose_frame()?;
+        state.toggle_shortcut_help();
+        let help = state.compose_frame()?;
+
+        assert!(state.shortcut_help_visible);
+        assert_ne!(normal.pixels, help.pixels);
+        Ok(())
     }
 
     #[test]
@@ -4719,10 +6659,66 @@ mod tests {
         let pending_url = begin_url(&mut state, "example.test")?;
 
         assert_eq!(state.navigation.pending_url.as_ref(), Some(&pending_url));
+        assert_eq!(
+            state.navigation.lifecycle,
+            NavigationLifecycle::LoadingMainResource
+        );
+        assert_eq!(state.navigation.generation, 1);
         assert!(matches!(
             state.status,
             PageStatus::Loading { ref url } if url == pending_url.as_str()
         ));
+        Ok(())
+    }
+
+    #[test]
+    fn starting_new_navigation_cancels_previous_pending_generation() -> WebbyResult<()> {
+        let mut state = AppState::with_window_size(160, 120);
+        let first = begin_url(&mut state, "first.example")?;
+        let first_generation = state.navigation.generation;
+
+        state.chrome.set_address_input("second.example");
+        let second = state
+            .begin_navigation()
+            .ok_or_else(|| WebbyError::invalid_input("second navigation did not resolve"))?;
+
+        assert_ne!(first, second);
+        assert_eq!(state.navigation.pending_url.as_ref(), Some(&second));
+        assert_eq!(state.navigation.generation, first_generation + 1);
+        assert!(state.navigation.lifecycle_diagnostics.iter().any(|item| {
+            item.contains("navigation cancelled")
+                && item.contains(first.as_str())
+                && item.contains(second.as_str())
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn stale_navigation_generation_cannot_replace_current_page() -> WebbyResult<()> {
+        let stale_url = url::Url::parse("https://stale.example/").map_err(url_error)?;
+        let current_url = url::Url::parse("https://current.example/").map_err(url_error)?;
+        let stale_page =
+            PagePipeline::new(160, 80).render_html("<body>Stale</body>", stale_url.clone())?;
+        let current_page =
+            PagePipeline::new(160, 80).render_html("<body>Current</body>", current_url.clone())?;
+        let mut state = AppState::with_window_size(160, 120);
+
+        state.begin_navigation_to_url(stale_url, PendingHistoryAction::Push);
+        let stale_generation = state.navigation.generation;
+        state.begin_navigation_to_url(current_url.clone(), PendingHistoryAction::Push);
+        let current_generation = state.navigation.generation;
+        state.finish_navigation_for_generation(current_generation, Ok(current_page));
+        state.finish_navigation_for_generation(stale_generation, Ok(stale_page));
+
+        assert_eq!(state.navigation.current_url.as_ref(), Some(&current_url));
+        assert_eq!(state.navigation.history, vec![current_url]);
+        assert!(
+            state
+                .navigation
+                .lifecycle_diagnostics
+                .iter()
+                .any(|item| item.contains("late navigation result ignored"))
+        );
         Ok(())
     }
 
@@ -4747,6 +6743,91 @@ mod tests {
     }
 
     #[test]
+    fn nested_wheel_scroll_is_per_tab_and_does_not_change_page_scroll() -> WebbyResult<()> {
+        let url = url::Url::parse("https://example.test/overflow").map_err(url_error)?;
+        let html = "<style>.clip { height: 24px; overflow-y: auto; } .spacer { height: 90px; }</style><body><div class=\"clip\"><div class=\"spacer\"></div><a href=\"/shown\">Shown</a></div></body>";
+        let page = PagePipeline::new(240, 120).render_html(html, url)?;
+        let container = page
+            .layout
+            .scroll_containers()
+            .first()
+            .copied()
+            .cloned()
+            .ok_or_else(|| WebbyError::invalid_input("missing nested scroll container"))?;
+        let mut state = AppState::with_window_size(240, 168);
+        state.finish_navigation(Ok(page));
+
+        state.scroll_at_window_position(
+            container.viewport.x + 1.0,
+            CHROME_HEIGHT as f32 + container.viewport.y + 1.0,
+            48.0,
+        );
+
+        assert_eq!(state.scroll_y, 0.0);
+        assert!(
+            state
+                .scroll_offsets
+                .get(&container.id)
+                .is_some_and(|offset| offset.y > 0.0)
+        );
+        state.resize(241, 168);
+        assert!(
+            state
+                .scroll_offsets
+                .get(&container.id)
+                .is_some_and(|offset| offset.y > 0.0)
+        );
+        state.validate_active_tab_sync()?;
+
+        state.new_tab();
+        assert!(state.scroll_offsets.is_empty());
+        assert!(state.switch_tab(0));
+        assert!(
+            state
+                .scroll_offsets
+                .get(&container.id)
+                .is_some_and(|offset| offset.y > 0.0)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn wheel_scroll_prefers_deepest_visible_nested_container() -> WebbyResult<()> {
+        let url = url::Url::parse("https://example.test/nested-overflow").map_err(url_error)?;
+        let html = "<style>.outer { height: 60px; overflow-y: auto; } .inner { height: 24px; overflow-y: auto; } .spacer { height: 90px; }</style><body><div class=\"outer\"><div class=\"inner\"><div class=\"spacer\"></div><a href=\"/inner\">Inner</a></div><div class=\"spacer\"></div></div></body>";
+        let page = PagePipeline::new(240, 120).render_html(html, url)?;
+        let containers = page.layout.scroll_containers();
+        let outer = containers
+            .first()
+            .copied()
+            .cloned()
+            .ok_or_else(|| WebbyError::invalid_input("missing outer scroll container"))?;
+        let inner = containers
+            .get(1)
+            .copied()
+            .cloned()
+            .ok_or_else(|| WebbyError::invalid_input("missing inner scroll container"))?;
+        let mut state = AppState::with_window_size(240, 168);
+        state.finish_navigation(Ok(page));
+
+        state.scroll_at_window_position(
+            inner.viewport.x + 1.0,
+            CHROME_HEIGHT as f32 + inner.viewport.y + 1.0,
+            48.0,
+        );
+
+        assert!(!state.scroll_offsets.contains_key(&outer.id));
+        assert!(
+            state
+                .scroll_offsets
+                .get(&inner.id)
+                .is_some_and(|offset| offset.y > 0.0)
+        );
+        state.validate_active_tab_sync()?;
+        Ok(())
+    }
+
+    #[test]
     fn browser_chrome_height_is_respected_for_page_content() {
         let state = AppState::with_window_size(320, 240);
 
@@ -4756,7 +6837,11 @@ mod tests {
     #[test]
     fn page_render_uses_display_list_and_software_renderer_output() -> WebbyResult<()> {
         let url = url::Url::parse("https://example.test/").map_err(url_error)?;
-        let page = PagePipeline::new(160, 120).render_html("<body>Hello</body>", url)?;
+        let pipeline = PagePipeline::new(160, 120);
+
+        assert_eq!(pipeline.render_backend_name(), "software");
+
+        let page = pipeline.render_html("<body>Hello</body>", url)?;
 
         assert!(!page.display_list.commands.is_empty());
         assert_eq!(page.surface.width, 160);
@@ -4804,6 +6889,54 @@ mod tests {
         )?;
 
         assert!(display_texts(&page).join(" ").contains("Added"));
+        Ok(())
+    }
+
+    #[test]
+    fn shadow_root_content_renders_instead_of_light_dom() -> WebbyResult<()> {
+        let url = url::Url::parse("https://example.test/").map_err(url_error)?;
+        let page = PagePipeline::new(220, 140).render_html(
+            "<body><x-card id=\"card\">Light fallback</x-card><script>var root = document.getElementById('card').attachShadow({ mode: 'open' }); var p = document.createElement('p'); p.textContent = 'Shadow content'; root.appendChild(p);</script></body>",
+            url,
+        )?;
+
+        let text = display_texts(&page).join(" ");
+        assert!(text.contains("Shadow"));
+        assert!(text.contains("content"));
+        assert!(!text.contains("Light"));
+        Ok(())
+    }
+
+    #[test]
+    fn custom_element_fixture_renders_shadow_content_and_styles() -> WebbyResult<()> {
+        let url = url::Url::parse("https://example.test/").map_err(url_error)?;
+        let page = PagePipeline::new(220, 140).render_html(
+            "<body><x-greeting></x-greeting><script>function Greeting() {} Greeting.prototype.connectedCallback = function() { var root = this.attachShadow({ mode: 'open' }); var style = document.createElement('style'); style.textContent = 'span { color: red; }'; var span = document.createElement('span'); span.textContent = 'Hello shadow'; root.appendChild(style); root.appendChild(span); }; customElements.define('x-greeting', Greeting);</script></body>",
+            url,
+        )?;
+
+        let text = display_texts(&page).join(" ");
+        assert!(text.contains("Hello"));
+        assert!(text.contains("shadow"));
+        assert!(page.display_list.commands.iter().any(|command| matches!(
+            command,
+            webby_render::DisplayCommand::DrawText { text, color, .. }
+                if text.starts_with("Hello") && color.r == 255 && color.g == 0 && color.b == 0
+        )));
+        Ok(())
+    }
+
+    #[test]
+    fn unsupported_custom_element_features_are_diagnostics() -> WebbyResult<()> {
+        let url = url::Url::parse("https://example.test/").map_err(url_error)?;
+        let page = PagePipeline::new(220, 140).render_html(
+            "<body><x-card id=\"card\"></x-card><script>document.getElementById('card').attachShadow({ mode: 'closed' });</script></body>",
+            url,
+        )?;
+
+        assert!(page.diagnostics.iter().any(|diagnostic| {
+            diagnostic.contains("JavaScript Shadow DOM unsupported attachShadow mode")
+        }));
         Ok(())
     }
 
@@ -5246,6 +7379,47 @@ mod tests {
         assert_eq!(state.navigation.current_url.as_ref(), Some(&next));
         assert!(state.timers.is_empty());
         assert!(!state.run_due_timers(&loader));
+        Ok(())
+    }
+
+    #[test]
+    fn stale_timer_generation_cannot_mutate_replaced_page() -> WebbyResult<()> {
+        let home = url::Url::parse("https://example.test/home").map_err(url_error)?;
+        let next = url::Url::parse("https://example.test/next").map_err(url_error)?;
+        let loader = TestSiteLoader::new([
+            (
+                home.as_str(),
+                "<body><p id=\"out\">Old</p><script>setTimeout(function() { document.getElementById('out').textContent = 'Timer'; }, 0);</script></body>",
+            ),
+            (next.as_str(), "<body><p>Next</p></body>"),
+        ]);
+        let mut state = AppState::with_window_size(240, 160);
+
+        state.navigate_to_url(&loader, home);
+        let stale_timer = state
+            .timers
+            .first()
+            .cloned()
+            .ok_or_else(|| WebbyError::invalid_input("test timer was not scheduled"))?;
+        state.navigate_to_url(&loader, next);
+        state.timers.push(stale_timer);
+
+        assert!(!state.run_due_timers(&loader));
+        let text = state
+            .page
+            .as_ref()
+            .map(display_texts)
+            .unwrap_or_default()
+            .join("");
+        assert!(text.contains("Next"));
+        assert!(!text.contains("Timer"));
+        assert!(
+            state
+                .navigation
+                .lifecycle_diagnostics
+                .iter()
+                .any(|item| item.contains("late timer ignored"))
+        );
         Ok(())
     }
 
@@ -6478,6 +8652,41 @@ mod tests {
     }
 
     #[test]
+    fn app_pipeline_reuses_disk_cache_across_state_restart() -> WebbyResult<()> {
+        let root = std::env::temp_dir().join(format!(
+            "webby-app-disk-cache-restart-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        let page_url = url::Url::parse("https://example.test/index.html").map_err(url_error)?;
+        let first_loader = CountingByteResourceLoader::new([(
+            page_url.as_str(),
+            "text/html; charset=utf-8",
+            b"<body>Persisted page</body>".to_vec(),
+        )]);
+        let mut first = AppState::with_window_size(160, 100);
+        first.enable_disk_cache(&root)?;
+        first.chrome.set_address_input(page_url.to_string());
+        first.submit_address(&first_loader);
+        assert!(matches!(first.status, PageStatus::Loaded { .. }));
+
+        let second_loader = CountingByteResourceLoader::new([]);
+        let mut second = AppState::with_window_size(160, 100);
+        second.enable_disk_cache(&root)?;
+        second.chrome.set_address_input(page_url.to_string());
+        second.submit_address(&second_loader);
+
+        assert!(matches!(second.status, PageStatus::Loaded { .. }));
+        assert_eq!(second_loader.calls.get(), 0);
+        assert!(second.page.as_ref().is_some_and(|page| {
+            page.diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.contains("disk-hit"))
+        }));
+        Ok(())
+    }
+
+    #[test]
     fn app_navigation_stores_and_sends_cookies() -> WebbyResult<()> {
         let login = url::Url::parse("https://example.test/login").map_err(url_error)?;
         let account = url::Url::parse("https://example.test/account").map_err(url_error)?;
@@ -6741,6 +8950,7 @@ mod tests {
         }));
 
         assert!(state.navigation.pending_url.is_none());
+        assert_eq!(state.navigation.lifecycle, NavigationLifecycle::Failed);
         assert_eq!(
             state.navigation.failed_url.as_deref(),
             Some(pending_url.as_str())
@@ -6976,6 +9186,156 @@ mod tests {
                 } if href == "/next"
             )
         }));
+        Ok(())
+    }
+
+    #[test]
+    fn tab_and_shift_tab_move_page_focus_deterministically() -> WebbyResult<()> {
+        let mut state = loaded_form_state(
+            "<p><a href=\"/first\">First</a></p><form><input type=\"text\" name=\"q\"><input type=\"submit\" value=\"Go\"></form>",
+        )?;
+
+        assert!(state.focus_next_page_item());
+        assert_eq!(
+            state.keyboard_focus,
+            Some(KeyboardFocusTarget::Link { index: 0 })
+        );
+        assert!(state.focus_next_page_item());
+        assert_eq!(
+            state.keyboard_focus,
+            Some(KeyboardFocusTarget::FormControl { id: 0 })
+        );
+        assert!(state.focus_previous_page_item());
+        assert_eq!(
+            state.keyboard_focus,
+            Some(KeyboardFocusTarget::Link { index: 0 })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn enter_on_focused_link_navigates() -> WebbyResult<()> {
+        let base = url::Url::parse("https://example.test/").map_err(url_error)?;
+        let mut state = AppState::with_window_size(240, 160);
+        state.finish_navigation(
+            PagePipeline::new(240, 112)
+                .render_html("<body><a href=\"/next\">Next</a></body>", base),
+        );
+        assert!(state.focus_next_page_item());
+        let target = url::Url::parse("https://example.test/next").map_err(url_error)?;
+        let loader = StaticHtmlLoader::new("<body>Arrived</body>", target.clone());
+
+        assert!(state.activate_keyboard_focus(&loader));
+
+        assert_eq!(state.navigation.current_url.as_ref(), Some(&target));
+        Ok(())
+    }
+
+    #[test]
+    fn keyboard_focus_keeps_text_inputs_editable_and_enter_submits() -> WebbyResult<()> {
+        let mut state = loaded_form_state(
+            "<form action=\"/find\"><label for=\"q\">Query</label><input id=\"q\" type=\"search\" name=\"q\"><input type=\"submit\" value=\"Go\"></form>",
+        )?;
+        assert!(state.focus_next_page_item());
+        state.type_character('r');
+        state.type_character('s');
+        state.backspace();
+        let target = url::Url::parse("https://example.test/find?q=r").map_err(url_error)?;
+        let loader = StaticHtmlLoader::new("<body>Results</body>", target.clone());
+
+        assert!(state.activate_keyboard_focus(&loader));
+
+        assert_eq!(state.navigation.current_url.as_ref(), Some(&target));
+        Ok(())
+    }
+
+    #[test]
+    fn space_toggles_focused_checkbox_without_navigation() -> WebbyResult<()> {
+        let mut state = loaded_form_state(
+            "<form><label><input type=\"checkbox\" name=\"ok\" value=\"yes\">Agree</label></form>",
+        )?;
+        assert!(state.focus_next_page_item());
+
+        assert!(state.press_space_on_keyboard_focus(&FailingLoader));
+
+        assert_eq!(state.form_values.get(&0).map(String::as_str), Some("true"));
+        assert!(matches!(state.status, PageStatus::Loaded { .. }));
+        Ok(())
+    }
+
+    #[test]
+    fn space_on_focused_submit_button_submits_form() -> WebbyResult<()> {
+        let mut state = loaded_form_state(
+            "<form action=\"/send\"><input type=\"text\" name=\"q\" value=\"webby\"><button type=\"submit\">Send</button></form>",
+        )?;
+        state.keyboard_focus = Some(KeyboardFocusTarget::FormControl { id: 1 });
+        state.focused_form_control = Some(1);
+        let target = url::Url::parse("https://example.test/send?q=webby").map_err(url_error)?;
+        let loader = StaticHtmlLoader::new("<body>Sent</body>", target.clone());
+
+        assert!(state.press_space_on_keyboard_focus(&loader));
+
+        assert_eq!(state.navigation.current_url.as_ref(), Some(&target));
+        Ok(())
+    }
+
+    #[test]
+    fn accessible_nodes_expose_names_roles_and_state() -> WebbyResult<()> {
+        let mut state = loaded_form_state(
+            "<p><a href=\"/about\">About us</a></p><p><a href=\"/logo\"><img src=\"missing.png\" alt=\"Logo mark\"></a></p><form><label for=\"q\">Search query</label><input id=\"q\" type=\"search\" name=\"q\"><button type=\"submit\" aria-label=\"Run search\">Go</button></form>",
+        )?;
+        state.keyboard_focus = Some(KeyboardFocusTarget::FormControl { id: 0 });
+        state.focused_form_control = Some(0);
+
+        let nodes = state.accessible_nodes();
+
+        assert!(nodes.iter().any(|node| {
+            node.role == AccessibleRole::Link
+                && node.name == "About us"
+                && node.href.as_deref() == Some("/about")
+        }));
+        assert!(nodes.iter().any(|node| {
+            node.role == AccessibleRole::Link
+                && node.name == "Logo mark"
+                && node.href.as_deref() == Some("/logo")
+        }));
+        assert!(nodes.iter().any(|node| {
+            node.role == AccessibleRole::Textbox
+                && node.name == "Search query"
+                && node.state.focused
+        }));
+        assert!(
+            nodes
+                .iter()
+                .any(|node| { node.role == AccessibleRole::Button && node.name == "Run search" })
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn keyboard_focus_ring_changes_composed_frame_pixels() -> WebbyResult<()> {
+        let mut state = loaded_form_state("<p><a href=\"/next\">Next</a></p>")?;
+        let before = state.compose_frame()?;
+
+        assert!(state.focus_next_page_item());
+        let after = state.compose_frame()?;
+
+        assert_ne!(before.pixels, after.pixels);
+        Ok(())
+    }
+
+    #[test]
+    fn keyboard_scroll_clamps_like_mouse_scroll() -> WebbyResult<()> {
+        let mut state = loaded_form_state(
+            "<div style=\"height: 1200px\">Tall</div><p><a href=\"/bottom\">Bottom</a></p>",
+        )?;
+
+        state.keyboard_scroll_by(10_000.0);
+        let scrolled = state.scroll_y;
+        state.keyboard_scroll_by(-10_000.0);
+
+        assert!(scrolled > 0.0);
+        assert_eq!(state.scroll_y, 0.0);
         Ok(())
     }
 
@@ -7534,7 +9894,7 @@ mod tests {
     #[test]
     fn display_none_link_and_form_controls_are_not_interactive() -> WebbyResult<()> {
         let base = url::Url::parse("https://example.test/").map_err(url_error)?;
-        let html = "<style>.hidden { display: none; }</style><body><p class=\"hidden\"><a href=\"/gone\">Gone</a><form action=\"/find\"><input name=\"q\"></form></p><p>Visible</p></body>";
+        let html = "<style>.hidden { display: none; }</style><body><div class=\"hidden\"><a href=\"/gone\">Gone</a><form action=\"/find\"><input name=\"q\"></form></div><p>Visible</p></body>";
         let page = PagePipeline::new(240, 160).render_html(html, base)?;
         let mut state = AppState::with_window_size(240, 220);
         state.finish_navigation(Ok(page));
@@ -7561,7 +9921,7 @@ mod tests {
     #[test]
     fn visibility_hidden_link_and_form_controls_are_not_interactive() -> WebbyResult<()> {
         let base = url::Url::parse("https://example.test/").map_err(url_error)?;
-        let html = "<style>.hidden { visibility: hidden; }</style><body><p class=\"hidden\"><a href=\"/gone\">Gone</a><form action=\"/find\"><input name=\"q\"></form></p><p>Visible</p></body>";
+        let html = "<style>.hidden { visibility: hidden; }</style><body><div class=\"hidden\"><a href=\"/gone\">Gone</a><form action=\"/find\"><input name=\"q\"></form></div><p>Visible</p></body>";
         let page = PagePipeline::new(240, 160).render_html(html, base)?;
         let mut state = AppState::with_window_size(240, 220);
         state.finish_navigation(Ok(page));
@@ -7923,6 +10283,52 @@ mod tests {
         false
     }
 
+    fn temp_download_dir(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("webby-download-{name}-{}", std::process::id()))
+    }
+
+    #[derive(Debug)]
+    struct DownloadResponseLoader {
+        url: url::Url,
+        content_type: String,
+        headers: Vec<(String, String)>,
+        bytes: Vec<u8>,
+    }
+
+    impl DownloadResponseLoader {
+        fn new(
+            url: url::Url,
+            content_type: &str,
+            headers: Vec<(String, String)>,
+            bytes: Vec<u8>,
+        ) -> Self {
+            Self {
+                url,
+                content_type: content_type.to_string(),
+                headers,
+                bytes,
+            }
+        }
+    }
+
+    impl ResourceLoader for DownloadResponseLoader {
+        fn load(&self, url: &url::Url) -> WebbyResult<ResourceResponse> {
+            if url != &self.url {
+                return Err(WebbyError::Network {
+                    message: format!("unexpected download URL {url}"),
+                });
+            }
+            Ok(ResourceResponse {
+                requested_url: url.clone(),
+                final_url: url.clone(),
+                status: Some(200),
+                content_type: Some(self.content_type.clone()),
+                headers: self.headers.clone(),
+                bytes: self.bytes.clone(),
+            })
+        }
+    }
+
     fn url_error(error: url::ParseError) -> WebbyError {
         WebbyError::Url {
             message: error.to_string(),
@@ -8251,6 +10657,68 @@ mod tests {
         }
     }
 
+    #[derive(Debug)]
+    struct BasicAuthLoader {
+        url: url::Url,
+        expected_header: String,
+        authorized_calls: Cell<usize>,
+    }
+
+    impl BasicAuthLoader {
+        fn new(url: url::Url, username: &str, password: &str) -> Self {
+            let credentials = webby_net::BasicCredentials::new(username, password);
+            Self {
+                url,
+                expected_header: credentials.authorization_header_value(),
+                authorized_calls: Cell::new(0),
+            }
+        }
+    }
+
+    impl ResourceLoader for BasicAuthLoader {
+        fn load(&self, url: &url::Url) -> WebbyResult<ResourceResponse> {
+            self.load_with_headers(url, &[])
+        }
+
+        fn load_with_headers(
+            &self,
+            url: &url::Url,
+            headers: &[(String, String)],
+        ) -> WebbyResult<ResourceResponse> {
+            if url != &self.url {
+                return Err(WebbyError::Network {
+                    message: format!("unexpected auth URL {url}"),
+                });
+            }
+            let authorized = headers.iter().any(|(name, value)| {
+                name.eq_ignore_ascii_case("authorization") && value == &self.expected_header
+            });
+            if authorized {
+                self.authorized_calls
+                    .set(self.authorized_calls.get().saturating_add(1));
+                return Ok(ResourceResponse {
+                    requested_url: url.clone(),
+                    final_url: url.clone(),
+                    status: Some(200),
+                    content_type: Some("text/html; charset=utf-8".to_string()),
+                    headers: Vec::new(),
+                    bytes: b"<body>Private</body>".to_vec(),
+                });
+            }
+            Ok(ResourceResponse {
+                requested_url: url.clone(),
+                final_url: url.clone(),
+                status: Some(401),
+                content_type: Some("text/html; charset=utf-8".to_string()),
+                headers: vec![(
+                    "www-authenticate".to_string(),
+                    "Basic realm=\"Members\"".to_string(),
+                )],
+                bytes: b"<body>Auth required</body>".to_vec(),
+            })
+        }
+    }
+
     #[derive(Debug, Default)]
     struct SequenceHtmlLoader {
         calls: Cell<usize>,
@@ -8540,6 +11008,29 @@ mod tests {
     }
 
     #[test]
+    fn clear_session_storage_preserves_tabs_and_active_context() -> WebbyResult<()> {
+        let url = url::Url::parse("https://example.test/").map_err(url_error)?;
+        let origin = webby_state::storage_origin_key(&url)?;
+        let mut state = AppState::with_window_size(240, 160);
+
+        state.session_storage.set_item(&origin, "tab", "one")?;
+        state.save_active_tab();
+        let second = state.new_tab();
+        state.session_storage.set_item(&origin, "tab", "two")?;
+        state.save_active_tab();
+
+        state.clear_session_storage();
+
+        assert_eq!(state.tab_count(), 2);
+        assert_eq!(state.active_tab_index, second);
+        assert_eq!(state.session_storage.get_item(&origin, "tab"), None);
+        assert!(state.switch_tab(0));
+        assert_eq!(state.session_storage.get_item(&origin, "tab"), None);
+        state.validate_active_tab_sync()?;
+        Ok(())
+    }
+
+    #[test]
     fn app_pipeline_renders_inline_svg_pixels() -> WebbyResult<()> {
         let url = url::Url::parse("https://example.test/svg").map_err(url_error)?;
         let page = PagePipeline::new(120, 80).render_html(
@@ -8584,6 +11075,21 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn html_parser_recovery_diagnostics_flow_into_page_state() -> WebbyResult<()> {
+        let url = url::Url::parse("https://example.test/recovery").map_err(url_error)?;
+        let page = PagePipeline::new(120, 80).render_html("<body>Visible<!-- missing", url)?;
+
+        assert_eq!(webby_html::extract_visible_text(&page.document), "Visible");
+        assert!(
+            page.diagnostics.contains(
+                &"HTML diagnostic at byte 13: unclosed comment ignored through end of input"
+                    .to_string()
+            )
+        );
+        Ok(())
+    }
+
     struct FailingLoader;
 
     impl ResourceLoader for FailingLoader {
@@ -8593,4 +11099,12 @@ mod tests {
             })
         }
     }
+}
+/// Cache tiers supplied to one loader-backed page pipeline.
+#[derive(Debug, Clone, Copy)]
+pub struct CacheTiers<'a> {
+    /// Shared in-memory fast path.
+    pub memory: &'a ResourceCache,
+    /// Optional persistent profile cache.
+    pub disk: Option<&'a DiskResourceCache>,
 }

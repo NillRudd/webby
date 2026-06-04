@@ -113,6 +113,13 @@ deterministic canvas commands through DOM attributes; they do not draw pixels
 directly. Basic SVG `viewBox` scaling is resolved in layout because it maps
 element-local geometry into the laid-out viewport.
 
+Shadow DOM and custom elements stay DOM/JavaScript owned. `webby_js` exposes
+`attachShadow({ mode: "open" })` and a small custom-elements registry as
+structured DOM mutations. `webby_dom` stores shadow-root children on the host,
+and `webby_style` builds the composed style tree by using shadow children when
+they exist. Layout and render continue to consume styled/layout trees only; they
+do not know custom-element lifecycle or shadow-attachment rules.
+
 ### Debug And CLI Dumps
 
 ```text
@@ -121,7 +128,7 @@ CSS dump        HTML -> webby_html -> webby_stylesheet/webby_css
 Style dump      HTML/CSS -> webby_style
 Layout dump     style tree -> webby_layout
 Display dump    layout tree -> webby_render display list
-Render PPM      display list -> webby_render software surface
+Render PPM      display list -> webby_render backend -> software surface
 Diagnostics     loader/cache/stylesheet/image/form/JavaScript diagnostics
 ```
 
@@ -170,16 +177,23 @@ Responsibilities:
 - file loading
 - data URL loading for static resource bytes
 - redirects
+- redirect loop/count enforcement, request timeout, gzip decoding, and response
+  byte limits
+- charset-aware text decoding helpers for callers that render HTML/CSS/text
 - caller-provided request headers for stateful loads
 - response metadata
 - response headers for coordinators such as cookie handling
+- Basic-auth challenge parsing and authorization header construction helpers
 - small MIME/content-type sniffing helpers for common static resources
 - text decoding helpers
+- top-level HTML-versus-download response classification metadata
 
 Should not:
 
 - interpret HTML structure
 - know layout/rendering details
+- choose download destinations or write downloaded files
+- store credentials or decide authentication UI state
 
 ### `webby_security`
 
@@ -202,7 +216,8 @@ Should not:
 
 ### `webby_cache`
 
-Stores successful resource bytes loaded through `webby_net`.
+Stores successful resource bytes loaded through `webby_net`, with an optional
+profile-backed disk tier below the in-memory fast path.
 
 Responsibilities:
 
@@ -211,6 +226,7 @@ Responsibilities:
 - enforce count and byte limits
 - evict by deterministic least-recently-used policy
 - expose hit/miss/store/refresh/evict diagnostics
+- serialize deterministic disk indexes and recover safely from corrupt entries
 
 Should not:
 
@@ -231,6 +247,7 @@ Responsibilities:
 - `ElementData`
 - attributes
 - tree traversal helpers
+- host-owned shadow-root children for Webby's open Shadow DOM subset
 
 Should not:
 
@@ -249,6 +266,7 @@ Responsibilities:
 - handle comments, doctypes, raw script/style blocks
 - expose inline/external script metadata in document order
 - expose stylesheet, favicon/icon, and resource-hint metadata in document order
+- expose trimmed document-title metadata
 - extract visible text
 
 Should not:
@@ -265,6 +283,7 @@ Responsibilities:
 - integrate the embeddable `boa_engine` JavaScript engine
 - execute ordered script text supplied by app/CLI pipeline coordinators
 - provide `console.log`, `window`, and Webby's small `document` binding
+- provide Webby's small open Shadow DOM and custom-elements bindings
 - register and dispatch Webby's small DOM event subset for app-selected
   targets
 - record JavaScript DOM operations and apply them through `webby_dom`
@@ -441,6 +460,9 @@ Turns layout into display commands and pixels.
 Responsibilities:
 
 - display list
+- backend-neutral display commands
+- `RenderBackend` abstraction for display-list-to-surface backends
+- deterministic software backend used by tests, CLI, and the native app
 - text drawing
 - rectangles/lines/backgrounds
 - circles and SVG/canvas primitive commands from layout metadata
@@ -453,6 +475,7 @@ Should not:
 - know parser internals
 - fetch or decode images
 - own navigation state
+- leak backend details into layout, style, DOM, app state, or CLI algorithms
 
 ### `webby_app`
 
@@ -464,17 +487,23 @@ Responsibilities:
 - address/search bar
 - clickable browser chrome and tab strip state
 - input handling
+- keyboard focus traversal, activation, and accessibility metadata for the
+  active page
 - hover feedback state
 - deterministic animation clock for scoped visual transitions
 - scroll handling
 - tab/session state
 - per-tab navigation, chrome, page status, scroll, and form edit state
+- explicit navigation lifecycle and generation tokens; newer navigations cancel
+  older pending work, and late navigation/timer results are ignored by app state
 - calls the engine pipeline
 - displays error pages
 - composes persistent profile APIs for homepage, bookmarks, recent pages, and
   successful navigation history
 - coordinates cookie sending/storage around resource loaders according to
   profile privacy config
+- owns in-memory HTTP Basic credential and challenge state; credentials are not
+  persisted by default
 - uses `webby_script` to coordinate external classic scripts and module graphs
   before passing ordered script sources into `webby_js`
 - supplies `webby_js` with viewport and current layout geometry snapshots for
@@ -483,11 +512,14 @@ Responsibilities:
   rendering ownership into app state
 - coordinates iframe nested browsing contexts through the same loader-backed
   page pipeline
+- draws app-owned focus rings from existing layout hit rectangles without
+  changing page layout
 
 Should not:
 
 - contain parsing/layout algorithms directly
 - parse persistence file formats directly
+- move keyboard interaction behavior into layout or render
 
 ### `webby_state`
 
@@ -502,6 +534,8 @@ Responsibilities:
 - bookmark and successful-history persistence APIs
 - cookie jar, `Set-Cookie` subset parsing, domain/path matching, session versus
   persistent cookies, and clear-cookies profile API
+- privacy/profile clearing APIs for history, bookmarks, cookies, localStorage,
+  and profile cache files
 
 Should not:
 
@@ -541,6 +575,35 @@ Should be used heavily by Codex for validation.
 - Styled tree may reference DOM or own IDs depending on ergonomics.
 - Layout tree should not require mutable access to DOM.
 - Display list owns draw commands and can be rendered repeatedly.
+
+## Memory And Resource Bounds
+
+Webby keeps the main pipeline inspectable by owning separate DOM, style, layout,
+display-list, and render-surface stages. That trades memory for debuggability,
+so large untrusted inputs are bounded before they can expand into later stages:
+
+- `webby_net` bounds retained response bodies to 8 MiB by default.
+- `webby_html` rejects HTML inputs above 4 MiB and DOMs above 16,384 nodes with
+  structured parse errors.
+- `webby_css` rejects stylesheet sources above 1 MiB with structured parse
+  errors. External stylesheet coordinators surface these as deterministic
+  diagnostics when the stylesheet is non-fatal.
+- `webby_script` skips inline and external script sources above 256 KiB with
+  deterministic JavaScript diagnostics before handing code to `webby_js`.
+- `webby_js` also enforces script count, script byte, and loop-iteration limits
+  during execution.
+- `webby_image` checks decoded image dimensions before retaining RGBA pixels and
+  rejects images above 16,000,000 pixels. Bulk page image loading keeps using
+  deterministic placeholders when load/decode fails.
+- `webby_cache` enforces deterministic entry and byte limits for resource bytes;
+  failed resource loads are never stored, while downstream decode failures do
+  not poison the byte cache.
+- Render surfaces remain bounded by explicit viewport dimensions and CLI/app
+  caps.
+
+These limits are intentionally conservative for the current toy-browser scope.
+They are documented constants rather than browser compatibility claims, and
+future performance work can tune them with measured fixture coverage.
 
 ## Error handling
 

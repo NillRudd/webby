@@ -157,6 +157,23 @@ mod tests {
     }
 
     #[test]
+    fn oversized_external_stylesheet_is_non_fatal_diagnostic() -> WebbyResult<()> {
+        let document = webby_html::parse_document("<link rel=\"stylesheet\" href=\"huge.css\">")?;
+        let base = url::Url::parse("https://example.test/index.html").map_err(url_error)?;
+        let loader = OversizedStylesheetLoader;
+
+        let loaded = load_external_stylesheets(&document, &base, &loader);
+
+        assert!(loaded.stylesheets.is_empty());
+        assert_eq!(loaded.diagnostics.len(), 1);
+        assert!(loaded.diagnostics[0].contains("https://example.test/huge.css"));
+        assert!(loaded.diagnostics[0].contains("could not be parsed"));
+        assert!(loaded.diagnostics[0].contains("CSS input"));
+        assert!(loaded.diagnostics[0].contains("limit"));
+        Ok(())
+    }
+
+    #[test]
     fn external_stylesheet_loading_can_use_shared_resource_cache() -> WebbyResult<()> {
         let document = webby_html::parse_document("<link rel=\"stylesheet\" href=\"site.css\">")?;
         let base = url::Url::parse("https://example.test/index.html").map_err(url_error)?;
@@ -210,6 +227,22 @@ mod tests {
                 content_type: Some("text/css".to_string()),
                 headers: Vec::new(),
                 bytes: format!("p {{ color: red; }} trailing for {url}").into_bytes(),
+            })
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    struct OversizedStylesheetLoader;
+
+    impl ResourceLoader for OversizedStylesheetLoader {
+        fn load(&self, url: &url::Url) -> WebbyResult<ResourceResponse> {
+            Ok(ResourceResponse {
+                requested_url: url.clone(),
+                final_url: url.clone(),
+                status: Some(200),
+                content_type: Some("text/css".to_string()),
+                headers: Vec::new(),
+                bytes: vec![b'a'; webby_css::MAX_STYLESHEET_BYTES + 1],
             })
         }
     }

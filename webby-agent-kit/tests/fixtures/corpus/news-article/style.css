@@ -1,0 +1,6 @@
+body { margin: 10px; color: #1f2937; background-color: #fffdf7; }
+header { border: 2px solid #991b1b; padding: 4px; }
+main { display: flex; gap: 12px; }
+article { width: 280px; padding: 6px; }
+aside { width: 100px; padding: 6px; background-color: #fef3c7; }
+.byline { color: #6b7280; font-size: 13px; }

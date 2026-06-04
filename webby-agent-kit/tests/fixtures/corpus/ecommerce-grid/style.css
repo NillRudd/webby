@@ -1,0 +1,4 @@
+body { margin: 8px; color: #422006; background-color: #fffbeb; }
+.products { display: grid; grid-template-columns: 110px 110px 110px; gap: 8px; }
+.product { padding: 6px; border: 1px solid #d97706; background-color: #ffffff; }
+.product h2 { font-size: 16px; }

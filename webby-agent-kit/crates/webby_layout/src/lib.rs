@@ -8,9 +8,10 @@ use webby_style::{
     AlignItems as StyleAlignItems, BoxSizing as StyleBoxSizing, Color as StyleColor, CssSize,
     Display, Edges, FlexDirection as StyleFlexDirection, FontFamily as StyleFontFamily,
     FontWeight as StyleFontWeight, GridPlacement as StyleGridPlacement,
-    GridTrack as StyleGridTrack, JustifyContent as StyleJustifyContent, Position as StylePosition,
-    StyledNode, TextAlign as StyleTextAlign, TextDecoration as StyleTextDecoration,
-    Visibility as StyleVisibility, WhiteSpace as StyleWhiteSpace,
+    GridTrack as StyleGridTrack, JustifyContent as StyleJustifyContent, Overflow as StyleOverflow,
+    Position as StylePosition, StyledNode, TextAlign as StyleTextAlign,
+    TextDecoration as StyleTextDecoration, Visibility as StyleVisibility,
+    WhiteSpace as StyleWhiteSpace,
 };
 use webby_text::{FontFamily as TextFontFamily, FontWeight as TextFontWeight};
 
@@ -56,6 +57,92 @@ pub struct Rect {
     pub width: f32,
     /// Height.
     pub height: f32,
+}
+
+/// Overflow behavior preserved for render and hit-testing consumers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Overflow {
+    /// Content may extend beyond the viewport.
+    Visible,
+    /// Content is clipped without scrolling.
+    Hidden,
+    /// Content is always scrollable.
+    Scroll,
+    /// Content is scrollable when it exceeds the viewport.
+    Auto,
+}
+
+impl From<StyleOverflow> for Overflow {
+    fn from(value: StyleOverflow) -> Self {
+        match value {
+            StyleOverflow::Visible => Self::Visible,
+            StyleOverflow::Hidden => Self::Hidden,
+            StyleOverflow::Scroll => Self::Scroll,
+            StyleOverflow::Auto => Self::Auto,
+        }
+    }
+}
+
+/// Mutable app-owned offset for one layout-owned scroll container.
+#[derive(Debug, Clone, Copy, PartialEq, Default)]
+pub struct ScrollOffset {
+    /// Horizontal scroll offset.
+    pub x: f32,
+    /// Vertical scroll offset.
+    pub y: f32,
+}
+
+/// Stable per-container scroll offsets keyed by DOM node id.
+pub type ScrollOffsets = std::collections::BTreeMap<u64, ScrollOffset>;
+
+/// Layout-owned geometry for one clipping or scrolling block container.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ScrollContainer {
+    /// Stable DOM node id.
+    pub id: u64,
+    /// Visible content viewport.
+    pub viewport: Rect,
+    /// Horizontal overflow behavior.
+    pub overflow_x: Overflow,
+    /// Vertical overflow behavior.
+    pub overflow_y: Overflow,
+    /// Maximum horizontal scroll offset.
+    pub max_scroll_x: f32,
+    /// Maximum vertical scroll offset.
+    pub max_scroll_y: f32,
+    /// Link range affected by this container.
+    pub link_range: std::ops::Range<usize>,
+    /// Form-control range affected by this container.
+    pub control_range: std::ops::Range<usize>,
+}
+
+/// Visible scroll-container viewport after ancestor offsets and clips.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VisibleScrollContainer {
+    /// Stable DOM node id.
+    pub id: u64,
+    /// Visible clipped viewport.
+    pub viewport: Rect,
+    /// Maximum vertical offset.
+    pub max_scroll_y: f32,
+}
+
+impl ScrollContainer {
+    /// Clamps an app-owned offset to this container's supported axes.
+    pub fn clamp_offset(&self, offset: ScrollOffset) -> ScrollOffset {
+        ScrollOffset {
+            x: if matches!(self.overflow_x, Overflow::Scroll | Overflow::Auto) {
+                offset.x.clamp(0.0, self.max_scroll_x)
+            } else {
+                0.0
+            },
+            y: if matches!(self.overflow_y, Overflow::Scroll | Overflow::Auto) {
+                offset.y.clamp(0.0, self.max_scroll_y)
+            } else {
+                0.0
+            },
+        }
+    }
 }
 
 /// Four-sided sizes used by the CSS box model.
@@ -556,6 +643,8 @@ pub struct LayoutBox {
     pub positioning: Positioning,
     /// Child layout algorithm.
     pub flow: LayoutFlow,
+    /// Optional clipping/scrolling metadata for this block.
+    pub scroll_container: Option<ScrollContainer>,
     /// Ordered content in paint/layout order.
     pub contents: Vec<LayoutItem>,
 }
@@ -702,6 +791,187 @@ pub struct LayoutTree {
     pub form_controls: Vec<FormControlHitBox>,
 }
 
+impl LayoutTree {
+    /// Returns scroll/clipping containers in deterministic layout order.
+    pub fn scroll_containers(&self) -> Vec<&ScrollContainer> {
+        let mut containers = Vec::new();
+        collect_scroll_containers(&self.root, &mut containers);
+        containers
+    }
+
+    /// Projects link hit regions through nested offsets and clips.
+    pub fn visible_links(&self, offsets: &ScrollOffsets) -> Vec<LinkHitBox> {
+        self.links
+            .iter()
+            .enumerate()
+            .filter_map(|(index, hit)| {
+                project_hit_rect(&self.root, hit.rect, offsets, HitRegion::Link(index)).map(
+                    |rect| LinkHitBox {
+                        rect,
+                        href: hit.href.clone(),
+                        node_id: hit.node_id,
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// Projects form hit regions through nested offsets and clips.
+    pub fn visible_form_controls(&self, offsets: &ScrollOffsets) -> Vec<FormControlHitBox> {
+        self.form_controls
+            .iter()
+            .enumerate()
+            .filter_map(|(index, hit)| {
+                project_hit_rect(&self.root, hit.rect, offsets, HitRegion::Control(index)).map(
+                    |rect| {
+                        let mut projected = hit.clone();
+                        projected.rect = rect;
+                        projected
+                    },
+                )
+            })
+            .collect()
+    }
+
+    /// Projects scroll-container viewports for pointer-based wheel routing.
+    pub fn visible_scroll_containers(
+        &self,
+        offsets: &ScrollOffsets,
+    ) -> Vec<VisibleScrollContainer> {
+        let mut visible = Vec::new();
+        collect_visible_scroll_containers(&self.root, offsets, 0.0, 0.0, None, &mut visible);
+        visible
+    }
+}
+
+fn collect_visible_scroll_containers(
+    layout_box: &LayoutBox,
+    offsets: &ScrollOffsets,
+    mut dx: f32,
+    mut dy: f32,
+    mut clip: Option<Rect>,
+    visible: &mut Vec<VisibleScrollContainer>,
+) {
+    if let Some(container) = &layout_box.scroll_container {
+        let viewport = translate_rect(container.viewport, dx, dy);
+        let Some(viewport) = clip
+            .map(|current| intersect_rect(current, viewport))
+            .unwrap_or(Some(viewport))
+        else {
+            return;
+        };
+        visible.push(VisibleScrollContainer {
+            id: container.id,
+            viewport,
+            max_scroll_y: container.max_scroll_y,
+        });
+        clip = Some(viewport);
+        let offset =
+            container.clamp_offset(offsets.get(&container.id).copied().unwrap_or_default());
+        dx -= offset.x;
+        dy -= offset.y;
+    }
+    for_each_child_box(layout_box, |child| {
+        collect_visible_scroll_containers(child, offsets, dx, dy, clip, visible);
+    });
+}
+
+#[derive(Debug, Clone, Copy)]
+enum HitRegion {
+    Link(usize),
+    Control(usize),
+}
+
+fn collect_scroll_containers<'a>(
+    layout_box: &'a LayoutBox,
+    containers: &mut Vec<&'a ScrollContainer>,
+) {
+    if let Some(container) = &layout_box.scroll_container {
+        containers.push(container);
+    }
+    for_each_child_box(layout_box, |child| {
+        collect_scroll_containers(child, containers)
+    });
+}
+
+fn project_hit_rect(
+    layout_box: &LayoutBox,
+    rect: Rect,
+    offsets: &ScrollOffsets,
+    region: HitRegion,
+) -> Option<Rect> {
+    let mut dx = 0.0;
+    let mut dy = 0.0;
+    let mut clip = None;
+    for container in {
+        let mut containers = Vec::new();
+        collect_scroll_containers(layout_box, &mut containers);
+        containers
+    } {
+        if !container_contains_region(container, region) {
+            continue;
+        }
+        let viewport = translate_rect(container.viewport, dx, dy);
+        clip = Some(match clip {
+            Some(current) => intersect_rect(current, viewport)?,
+            None => viewport,
+        });
+        let offset =
+            container.clamp_offset(offsets.get(&container.id).copied().unwrap_or_default());
+        dx -= offset.x;
+        dy -= offset.y;
+    }
+    let projected = translate_rect(rect, dx, dy);
+    match clip {
+        Some(clip) => intersect_rect(projected, clip),
+        None => Some(projected),
+    }
+}
+
+fn container_contains_region(container: &ScrollContainer, region: HitRegion) -> bool {
+    match region {
+        HitRegion::Link(index) => container.link_range.contains(&index),
+        HitRegion::Control(index) => container.control_range.contains(&index),
+    }
+}
+
+fn for_each_child_box<'a>(layout_box: &'a LayoutBox, mut visit: impl FnMut(&'a LayoutBox)) {
+    for item in &layout_box.contents {
+        match item {
+            LayoutItem::LineBox(line) => {
+                for fragment in &line.fragments {
+                    if let InlineFragment::Box(child) = fragment {
+                        visit(child);
+                    }
+                }
+            }
+            LayoutItem::Box(child) => visit(child),
+            LayoutItem::Text(_) => {}
+        }
+    }
+}
+
+fn translate_rect(rect: Rect, dx: f32, dy: f32) -> Rect {
+    Rect {
+        x: rect.x + dx,
+        y: rect.y + dy,
+        ..rect
+    }
+}
+
+fn intersect_rect(left: Rect, right: Rect) -> Option<Rect> {
+    let x = left.x.max(right.x);
+    let y = left.y.max(right.y);
+    let right_edge = (left.x + left.width).min(right.x + right.width);
+    let bottom = (left.y + left.height).min(right.y + right.height);
+    (right_edge > x && bottom > y).then_some(Rect {
+        x,
+        y,
+        width: right_edge - x,
+        height: bottom - y,
+    })
+}
+
 /// Builds a layout tree for styled content in the given viewport.
 pub fn layout_tree(styled_root: &StyledNode<'_>, viewport: Viewport) -> WebbyResult<LayoutTree> {
     layout_tree_with_images(styled_root, viewport, &ImageMap::empty())
@@ -790,6 +1060,8 @@ fn layout_block(
     inherited_form: Option<FormMetadata>,
     state: &mut LayoutState,
 ) -> WebbyResult<LayoutBox> {
+    let link_start = state.links.len();
+    let control_start = state.form_controls.len();
     let form_context = form_context_for_node(node, inherited_form, state);
     let margin = EdgeSizes::from(node.style.margin);
     let padding = EdgeSizes::from(node.style.padding);
@@ -871,7 +1143,47 @@ fn layout_block(
         )?;
     } else {
         for child in &node.children {
-            if matches!(
+            let block_form_control =
+                child.style.display == Display::Block && is_form_control_node(child);
+            if block_form_control {
+                cursor_y = flush_inline_nodes(
+                    &inline_nodes,
+                    Rect {
+                        x: content_x,
+                        y: cursor_y,
+                        width: content_width,
+                        height: 0.0,
+                    },
+                    &mut contents,
+                    InlineFlushContext {
+                        images,
+                        form_context: form_context.clone(),
+                        inherited_link: link_ref(node),
+                        text_align: node.style.text_align,
+                        state,
+                    },
+                )?;
+                inline_nodes.clear();
+                inline_nodes.push(child);
+                cursor_y = flush_inline_nodes(
+                    &inline_nodes,
+                    Rect {
+                        x: content_x,
+                        y: cursor_y,
+                        width: content_width,
+                        height: 0.0,
+                    },
+                    &mut contents,
+                    InlineFlushContext {
+                        images,
+                        form_context: form_context.clone(),
+                        inherited_link: link_ref(node),
+                        text_align: node.style.text_align,
+                        state,
+                    },
+                )?;
+                inline_nodes.clear();
+            } else if matches!(
                 child.style.display,
                 Display::Block | Display::Flex | Display::Grid
             ) {
@@ -956,6 +1268,13 @@ fn layout_block(
         border,
         margin,
     };
+    let scroll_container = scroll_container_for(
+        node,
+        dimensions.content,
+        &contents,
+        link_start..state.links.len(),
+        control_start..state.form_controls.len(),
+    );
 
     Ok(LayoutBox {
         kind,
@@ -963,8 +1282,65 @@ fn layout_block(
         visuals: box_visuals(node),
         positioning: Positioning::default(),
         flow: flow_for(node),
+        scroll_container,
         contents,
     })
+}
+
+fn scroll_container_for(
+    node: &StyledNode<'_>,
+    viewport: Rect,
+    contents: &[LayoutItem],
+    link_range: std::ops::Range<usize>,
+    control_range: std::ops::Range<usize>,
+) -> Option<ScrollContainer> {
+    let overflow_x = Overflow::from(node.style.overflow_x);
+    let overflow_y = Overflow::from(node.style.overflow_y);
+    if overflow_x == Overflow::Visible && overflow_y == Overflow::Visible {
+        return None;
+    }
+    let bounds = content_bounds(contents).unwrap_or(viewport);
+    Some(ScrollContainer {
+        id: node.node.id,
+        viewport,
+        overflow_x,
+        overflow_y,
+        max_scroll_x: (bounds.x + bounds.width - viewport.x - viewport.width).max(0.0),
+        max_scroll_y: (bounds.y + bounds.height - viewport.y - viewport.height).max(0.0),
+        link_range,
+        control_range,
+    })
+}
+
+fn content_bounds(contents: &[LayoutItem]) -> Option<Rect> {
+    let mut bounds = None;
+    for item in contents {
+        let rect = match item {
+            LayoutItem::LineBox(line) => line.rect,
+            LayoutItem::Text(run) => run.rect,
+            LayoutItem::Box(child) => child.dimensions.margin_box(),
+        };
+        bounds = Some(union_rect(bounds.unwrap_or(rect), rect));
+    }
+    bounds
+}
+
+fn union_rect(left: Rect, right: Rect) -> Rect {
+    let x = left.x.min(right.x);
+    let y = left.y.min(right.y);
+    Rect {
+        x,
+        y,
+        width: (left.x + left.width).max(right.x + right.width) - x,
+        height: (left.y + left.height).max(right.y + right.height) - y,
+    }
+}
+
+fn is_form_control_node(node: &StyledNode<'_>) -> bool {
+    matches!(
+        node.tag_name(),
+        Some("input" | "button" | "select" | "textarea")
+    )
 }
 
 fn positioning_for(node: &StyledNode<'_>) -> Positioning {
@@ -1244,6 +1620,7 @@ fn layout_table_section(
         visuals: box_visuals(node),
         positioning: Positioning::default(),
         flow: LayoutFlow::Table,
+        scroll_container: None,
         contents,
     })
 }
@@ -1308,6 +1685,7 @@ fn layout_table_row(
         visuals: box_visuals(node),
         positioning: Positioning::default(),
         flow: LayoutFlow::Table,
+        scroll_container: None,
         contents,
     })
 }
@@ -1572,6 +1950,7 @@ fn layout_replaced_grid_item(
         visuals: box_visuals(node),
         positioning: Positioning::default(),
         flow: LayoutFlow::Block,
+        scroll_container: None,
         contents: Vec::new(),
     }
 }
@@ -2314,6 +2693,14 @@ fn collect_inline_items(
     state: &mut InlineCollectionState,
     items: &mut Vec<InlineItem>,
 ) {
+    if node.style.display != Display::None
+        && let Some(control) = form_control_item(node, form_context)
+    {
+        state.pending_space = false;
+        items.push(InlineItem::Control(control));
+        return;
+    }
+
     match node.style.display {
         Display::None | Display::Block | Display::Flex | Display::Grid => {}
         Display::LineBreak => {
@@ -2323,12 +2710,6 @@ fn collect_inline_items(
             }));
         }
         Display::Inline | Display::InlineBlock => {
-            if let Some(control) = form_control_item(node, form_context) {
-                state.pending_space = false;
-                items.push(InlineItem::Control(control));
-                return;
-            }
-
             if matches!(
                 node.tag_name(),
                 Some("img" | "svg" | "canvas" | "audio" | "video" | "iframe")
@@ -3283,6 +3664,16 @@ fn dump_box(layout_box: &LayoutBox, depth: usize, output: &mut String) {
     output.push_str(&format_px(layout_box.positioning.offset_y));
     output.push_str(" flow=");
     output.push_str(layout_box.flow.as_str());
+    if let Some(container) = &layout_box.scroll_container {
+        output.push_str(" scroll-container=");
+        output.push_str(&container.id.to_string());
+        output.push_str(" viewport=");
+        output.push_str(&format_rect(container.viewport));
+        output.push_str(" max-scroll=");
+        output.push_str(&format_px(container.max_scroll_x));
+        output.push(',');
+        output.push_str(&format_px(container.max_scroll_y));
+    }
     if let LayoutKind::Image {
         src, alt, image, ..
     } = &layout_box.kind
@@ -3666,6 +4057,7 @@ impl InlineLayoutContext<'_> {
             visuals: image.visuals,
             positioning: Positioning::default(),
             flow: LayoutFlow::Block,
+            scroll_container: None,
             contents: image_contents,
         };
         let baseline = flow_height;
@@ -3746,6 +4138,7 @@ impl InlineLayoutContext<'_> {
             visuals: control.visuals,
             positioning: Positioning::default(),
             flow: LayoutFlow::Block,
+            scroll_container: None,
             contents,
         };
         let id = self.state.next_control_id;
@@ -4031,6 +4424,34 @@ mod tests {
         let result = Viewport::new(f32::NAN, 600.0);
 
         assert!(matches!(result, Err(WebbyError::InvalidInput { .. })));
+    }
+
+    #[test]
+    fn generated_viewport_boundaries_are_rejected_or_laid_out_safely() -> WebbyResult<()> {
+        for width in [
+            f32::NEG_INFINITY,
+            -1.0,
+            0.0,
+            f32::NAN,
+            0.001,
+            1.0,
+            32.0,
+            1_000_000.0,
+            f32::INFINITY,
+        ] {
+            match Viewport::with_width(width) {
+                Ok(_) => {
+                    let first = layout_html("<body><p>boundary layout text</p></body>", width)?;
+                    let second = layout_html("<body><p>boundary layout text</p></body>", width)?;
+
+                    assert_eq!(dump_layout_tree(&first), dump_layout_tree(&second));
+                }
+                Err(error) => {
+                    assert!(matches!(error, WebbyError::InvalidInput { .. }));
+                }
+            }
+        }
+        Ok(())
     }
 
     #[test]
@@ -5414,6 +5835,24 @@ mod tests {
     }
 
     #[test]
+    fn block_styled_form_controls_keep_hit_regions() -> WebbyResult<()> {
+        let tree = layout_html(
+            "<style>input { display: block; }</style><body><form><input type=\"email\" name=\"email\"><input type=\"password\" name=\"password\"><button type=\"submit\">Sign in</button></form></body>",
+            360.0,
+        )?;
+
+        assert_eq!(tree.form_controls.len(), 3);
+        assert_eq!(tree.form_controls[0].control_type, FormControlType::Email);
+        assert_eq!(
+            tree.form_controls[1].control_type,
+            FormControlType::Password
+        );
+        assert_eq!(tree.form_controls[2].control_type, FormControlType::Submit);
+        assert!(tree.form_controls[1].rect.y > tree.form_controls[0].rect.y);
+        Ok(())
+    }
+
+    #[test]
     fn form_control_dump_is_deterministic_and_clear() -> WebbyResult<()> {
         let tree = layout_html(
             "<body><form><input type=\"text\" name=\"q\" placeholder=\"Search\"><button type=\"submit\" name=\"go\" value=\"1\">Go</button></form></body>",
@@ -5439,6 +5878,47 @@ mod tests {
         let dump = dump_layout_tree(&tree);
 
         assert!(dump.contains("p id=\"intro\" class=\"card highlighted\" kind=block"));
+        Ok(())
+    }
+
+    #[test]
+    fn overflow_hidden_clips_descendant_link_hit_regions() -> WebbyResult<()> {
+        let tree = layout_html(
+            "<style>.clip { height: 20px; overflow: hidden; } .spacer { height: 80px; }</style><body><div class=\"clip\"><div class=\"spacer\"></div><a href=\"/hidden\">Hidden</a></div></body>",
+            260.0,
+        )?;
+
+        assert_eq!(tree.scroll_containers().len(), 1);
+        assert_eq!(tree.links.len(), 1);
+        assert!(tree.visible_links(&super::ScrollOffsets::new()).is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn overflow_auto_projects_scrolled_link_into_visible_viewport() -> WebbyResult<()> {
+        let tree = layout_html(
+            "<style>.clip { height: 20px; overflow-y: auto; } .spacer { height: 80px; }</style><body><div class=\"clip\"><div class=\"spacer\"></div><a href=\"/shown\">Shown</a></div></body>",
+            260.0,
+        )?;
+        let container = tree
+            .scroll_containers()
+            .first()
+            .copied()
+            .ok_or_else(|| WebbyError::invalid_input("missing scroll container"))?;
+        let mut offsets = super::ScrollOffsets::new();
+        offsets.insert(
+            container.id,
+            super::ScrollOffset {
+                x: 0.0,
+                y: container.max_scroll_y,
+            },
+        );
+
+        let visible = tree.visible_links(&offsets);
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].href, "/shown");
+        assert!(visible[0].rect.y >= container.viewport.y);
+        assert!(visible[0].rect.y < container.viewport.y + container.viewport.height);
         Ok(())
     }
 

@@ -75,6 +75,17 @@ Debug overlay demo:
 In headless or non-interactive environments this runs a one-frame startup smoke
 path instead of requiring a native window.
 
+## Optional Real-Site Smoke Check
+
+Network-dependent smoke testing is intentionally manual:
+
+```bash
+scripts/real-site-smoke.sh
+```
+
+See `docs/REAL_SITE_SMOKE.md`. This is not part of the required CI validation
+loop.
+
 ## Documentation Sanity Checks
 
 For docs cleanup, run:

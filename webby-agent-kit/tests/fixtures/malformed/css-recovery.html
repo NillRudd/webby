@@ -1,0 +1,17 @@
+<!doctype html>
+<html>
+  <head>
+    <title>Malformed CSS recovery</title>
+    <style>
+      .broken > > p { color: red; }
+      [href { background: blue; }
+      main { background: #e8f5e9; padding: 4px; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>CSS recovery stays visible</h1>
+      <p>Valid declarations after malformed selectors still apply.</p>
+    </main>
+  </body>
+</html>

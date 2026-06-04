@@ -1,9 +1,14 @@
 //! HTML tokenization, DOM parsing, and visible-text extraction.
 
-use std::collections::BTreeMap;
+use std::{collections::BTreeMap, fmt};
 
-use webby_core::WebbyResult;
+use webby_core::{WebbyError, WebbyResult};
 use webby_dom::{Document, Node, NodeKind};
+
+/// Maximum HTML source bytes accepted by the parser.
+pub const MAX_HTML_INPUT_BYTES: usize = 4 * 1024 * 1024;
+/// Maximum DOM nodes produced by one parsed document, including the document root.
+pub const MAX_DOM_NODES: usize = 16_384;
 
 /// Stylesheet link metadata collected from the DOM in document order.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -93,19 +98,67 @@ pub struct ScriptElement {
     pub async_attr: bool,
 }
 
+/// A deterministic forgiving-parser diagnostic.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HtmlDiagnostic {
+    /// Byte offset where recovery started.
+    pub offset: usize,
+    /// Human-readable recovery description.
+    pub message: String,
+}
+
+impl fmt::Display for HtmlDiagnostic {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "HTML diagnostic at byte {}: {}",
+            self.offset, self.message
+        )
+    }
+}
+
+/// DOM output plus diagnostics from forgiving HTML recovery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ParsedDocument {
+    /// Parsed DOM document.
+    pub document: Document,
+    /// Recoverable parser diagnostics in input order.
+    pub diagnostics: Vec<HtmlDiagnostic>,
+}
+
 /// Parses HTML into Webby's DOM.
 pub fn parse_document(input: &str) -> WebbyResult<Document> {
-    let tokens = tokenize(input);
+    Ok(parse_document_with_diagnostics(input)?.document)
+}
+
+/// Parses HTML into Webby's DOM and retains deterministic recovery diagnostics.
+pub fn parse_document_with_diagnostics(input: &str) -> WebbyResult<ParsedDocument> {
+    if input.len() > MAX_HTML_INPUT_BYTES {
+        return Err(WebbyError::Parse {
+            message: format!(
+                "HTML input is {} bytes, limit is {} bytes",
+                input.len(),
+                MAX_HTML_INPUT_BYTES
+            ),
+        });
+    }
+    let (tokens, diagnostics) = tokenize(input);
     let mut stack = vec![Node::document()];
+    let mut node_count = 1usize;
 
     for token in tokens {
         match token {
-            Token::Text(text) => append_child(&mut stack, Node::text(text)),
+            Token::Text(text) => {
+                note_dom_node(&mut node_count)?;
+                append_child(&mut stack, Node::text(text));
+            }
             Token::StartTag {
                 tag_name,
                 attributes,
                 self_closing,
             } => {
+                close_optional_elements_for_start_tag(&mut stack, &tag_name);
+                note_dom_node(&mut node_count)?;
                 let node = Node::element(tag_name, attributes);
                 if self_closing {
                     append_child(&mut stack, node);
@@ -127,7 +180,20 @@ pub fn parse_document(input: &str) -> WebbyResult<Document> {
         root: stack.pop().unwrap_or_else(Node::document),
     };
     document.assign_stable_ids();
-    Ok(document)
+    Ok(ParsedDocument {
+        document,
+        diagnostics,
+    })
+}
+
+fn note_dom_node(node_count: &mut usize) -> WebbyResult<()> {
+    *node_count = node_count.saturating_add(1);
+    if *node_count > MAX_DOM_NODES {
+        return Err(WebbyError::Parse {
+            message: format!("DOM node limit {MAX_DOM_NODES} exceeded"),
+        });
+    }
+    Ok(())
 }
 
 /// Extracts visible text from an existing DOM tree.
@@ -156,6 +222,15 @@ pub fn collect_icon_links(document: &Document) -> Vec<IconLink> {
     let mut links = Vec::new();
     collect_icon_links_from_node(&document.root, &mut links);
     links
+}
+
+/// Extracts the first document title as trimmed text.
+pub fn extract_document_title(document: &Document) -> String {
+    find_first_tag(&document.root, "title")
+        .map(node_text_content)
+        .unwrap_or_default()
+        .trim()
+        .to_string()
 }
 
 /// Collects preload/preconnect hints in document order.
@@ -245,7 +320,7 @@ fn collect_scripts_from_node(
         return;
     }
 
-    for child in &node.children {
+    for child in node.tree_children() {
         collect_scripts_from_node(child, counts, scripts);
     }
 }
@@ -254,7 +329,7 @@ fn collect_text_descendants(node: &Node, output: &mut String) {
     match &node.kind {
         NodeKind::Text(text) => output.push_str(text),
         NodeKind::Document | NodeKind::Element(_) => {
-            for child in &node.children {
+            for child in node.tree_children() {
                 collect_text_descendants(child, output);
             }
         }
@@ -279,7 +354,7 @@ fn collect_stylesheet_links_from_node(node: &Node, links: &mut Vec<StylesheetLin
         }
     }
 
-    for child in &node.children {
+    for child in node.tree_children() {
         collect_stylesheet_links_from_node(child, links);
     }
 }
@@ -302,8 +377,31 @@ fn collect_icon_links_from_node(node: &Node, links: &mut Vec<IconLink>) {
         }
     }
 
-    for child in &node.children {
+    for child in node.tree_children() {
         collect_icon_links_from_node(child, links);
+    }
+}
+
+fn find_first_tag<'a>(node: &'a Node, tag_name: &str) -> Option<&'a Node> {
+    if let NodeKind::Element(element) = &node.kind
+        && element.tag_name == tag_name
+    {
+        return Some(node);
+    }
+    node.tree_children()
+        .find_map(|child| find_first_tag(child, tag_name))
+}
+
+fn node_text_content(node: &Node) -> String {
+    match &node.kind {
+        NodeKind::Text(text) => text.clone(),
+        NodeKind::Document | NodeKind::Element(_) => {
+            let mut text = String::new();
+            for child in node.tree_children() {
+                text.push_str(&node_text_content(child));
+            }
+            text
+        }
     }
 }
 
@@ -325,7 +423,7 @@ fn collect_resource_hints_from_node(node: &Node, hints: &mut Vec<ResourceHint>) 
         });
     }
 
-    for child in &node.children {
+    for child in node.tree_children() {
         collect_resource_hints_from_node(child, hints);
     }
 }
@@ -343,7 +441,7 @@ fn collect_iframes_from_node(node: &Node, iframes: &mut Vec<IframeElement>) {
         });
     }
 
-    for child in &node.children {
+    for child in node.tree_children() {
         collect_iframes_from_node(child, iframes);
     }
 }
@@ -359,8 +457,9 @@ enum Token {
     Text(String),
 }
 
-fn tokenize(input: &str) -> Vec<Token> {
+fn tokenize(input: &str) -> (Vec<Token>, Vec<HtmlDiagnostic>) {
     let mut tokens = Vec::new();
+    let mut diagnostics = Vec::new();
     let mut cursor = 0;
 
     while cursor < input.len() {
@@ -378,7 +477,15 @@ fn tokenize(input: &str) -> Vec<Token> {
         let markup = &input[cursor..];
 
         if markup.starts_with("<!--") {
-            cursor += find_after(markup, "-->").unwrap_or(markup.len());
+            if let Some(after) = find_after(markup, "-->") {
+                cursor += after;
+            } else {
+                diagnostics.push(HtmlDiagnostic {
+                    offset: cursor,
+                    message: "unclosed comment ignored through end of input".to_string(),
+                });
+                cursor = input.len();
+            }
             continue;
         }
 
@@ -386,12 +493,24 @@ fn tokenize(input: &str) -> Vec<Token> {
             .get(..9)
             .is_some_and(|prefix| prefix.eq_ignore_ascii_case("<!doctype"))
         {
-            cursor += find_after(markup, ">").unwrap_or(markup.len());
+            if let Some(after) = find_after(markup, ">") {
+                cursor += after;
+            } else {
+                diagnostics.push(HtmlDiagnostic {
+                    offset: cursor,
+                    message: "unclosed doctype ignored through end of input".to_string(),
+                });
+                cursor = input.len();
+            }
             continue;
         }
 
         if markup.starts_with("</") {
             let Some(tag_end) = find_after(markup, ">") else {
+                diagnostics.push(HtmlDiagnostic {
+                    offset: cursor,
+                    message: "unclosed end tag preserved as text".to_string(),
+                });
                 push_text(&mut tokens, markup);
                 break;
             };
@@ -405,6 +524,10 @@ fn tokenize(input: &str) -> Vec<Token> {
 
         if markup.starts_with('<') {
             let Some(tag_end) = find_tag_end(markup) else {
+                diagnostics.push(HtmlDiagnostic {
+                    offset: cursor,
+                    message: "unclosed start tag preserved as text".to_string(),
+                });
                 push_text(&mut tokens, markup);
                 break;
             };
@@ -418,21 +541,34 @@ fn tokenize(input: &str) -> Vec<Token> {
                 });
                 cursor += tag_end;
 
-                if is_raw_text_element(&tag_name) {
+                if is_raw_text_element(&tag_name) || is_escapable_raw_text_element(&tag_name) {
                     let raw_text_start = cursor;
                     match find_raw_text_close(&input[cursor..], &tag_name) {
                         Some(close) => {
                             if preserves_raw_text_in_dom(&tag_name) {
-                                let style_text =
-                                    &input[raw_text_start..raw_text_start + close.start];
-                                push_text(&mut tokens, style_text);
+                                let text = &input[raw_text_start..raw_text_start + close.start];
+                                push_raw_text(
+                                    &mut tokens,
+                                    text,
+                                    is_escapable_raw_text_element(&tag_name),
+                                );
                             }
                             cursor += close.after;
                             tokens.push(Token::EndTag(tag_name));
                         }
                         None => {
+                            diagnostics.push(HtmlDiagnostic {
+                                offset: raw_text_start,
+                                message: format!(
+                                    "unclosed {tag_name} element preserved through end of input"
+                                ),
+                            });
                             if preserves_raw_text_in_dom(&tag_name) {
-                                push_text(&mut tokens, &input[cursor..]);
+                                push_raw_text(
+                                    &mut tokens,
+                                    &input[cursor..],
+                                    is_escapable_raw_text_element(&tag_name),
+                                );
                             }
                             cursor = input.len();
                             tokens.push(Token::EndTag(tag_name));
@@ -447,13 +583,25 @@ fn tokenize(input: &str) -> Vec<Token> {
         cursor += 1;
     }
 
-    tokens
+    (tokens, diagnostics)
 }
 
 fn push_text(tokens: &mut Vec<Token>, text: &str) {
     if !text.is_empty() {
         tokens.push(Token::Text(decode_entities(text)));
     }
+}
+
+fn push_raw_text(tokens: &mut Vec<Token>, text: &str, decode: bool) {
+    if text.is_empty() {
+        return;
+    }
+    let text = if decode {
+        decode_entities(text)
+    } else {
+        text.to_string()
+    };
+    tokens.push(Token::Text(text));
 }
 
 fn find_after(input: &str, pattern: &str) -> Option<usize> {
@@ -632,21 +780,105 @@ fn find_raw_text_close(input: &str, tag_name: &str) -> Option<RawTextClose> {
 }
 
 fn is_void_element(tag_name: &str) -> bool {
-    matches!(tag_name, "br" | "img" | "meta" | "link" | "input")
+    matches!(
+        tag_name,
+        "area"
+            | "base"
+            | "br"
+            | "col"
+            | "embed"
+            | "hr"
+            | "img"
+            | "input"
+            | "link"
+            | "meta"
+            | "source"
+            | "track"
+            | "wbr"
+    )
 }
 
 fn is_raw_text_element(tag_name: &str) -> bool {
     matches!(tag_name, "script" | "style")
 }
 
+fn is_escapable_raw_text_element(tag_name: &str) -> bool {
+    matches!(tag_name, "textarea" | "title")
+}
+
 fn preserves_raw_text_in_dom(tag_name: &str) -> bool {
-    matches!(tag_name, "script" | "style")
+    matches!(tag_name, "script" | "style" | "textarea" | "title")
 }
 
 fn append_child(stack: &mut [Node], node: Node) {
     if let Some(parent) = stack.last_mut() {
         parent.children.push(node);
     }
+}
+
+fn close_optional_elements_for_start_tag(stack: &mut Vec<Node>, tag_name: &str) {
+    if closes_open_paragraph(tag_name) {
+        close_open_optional_element(stack, &["p"], &[]);
+    }
+
+    match tag_name {
+        "li" => close_open_optional_element(stack, &["li"], &["ol", "ul"]),
+        "thead" | "tbody" | "tfoot" => {
+            close_open_optional_element(stack, &["td", "th"], &["table"]);
+            close_open_optional_element(stack, &["tr"], &["table"]);
+            close_open_optional_element(stack, &["thead", "tbody", "tfoot"], &["table"]);
+        }
+        "tr" => {
+            close_open_optional_element(stack, &["td", "th"], &["table"]);
+            close_open_optional_element(stack, &["tr"], &["table"]);
+        }
+        "td" | "th" => close_open_optional_element(stack, &["td", "th"], &["table", "tr"]),
+        _ => {}
+    }
+}
+
+fn close_open_optional_element(stack: &mut Vec<Node>, tag_names: &[&str], boundaries: &[&str]) {
+    for tag_name in stack.iter().rev().filter_map(element_name) {
+        if tag_names.contains(&tag_name) {
+            let tag_name = tag_name.to_string();
+            close_element(stack, &tag_name);
+            return;
+        }
+        if boundaries.contains(&tag_name) {
+            return;
+        }
+    }
+}
+
+fn closes_open_paragraph(tag_name: &str) -> bool {
+    matches!(
+        tag_name,
+        "address"
+            | "article"
+            | "aside"
+            | "blockquote"
+            | "div"
+            | "dl"
+            | "fieldset"
+            | "footer"
+            | "form"
+            | "h1"
+            | "h2"
+            | "h3"
+            | "h4"
+            | "h5"
+            | "h6"
+            | "header"
+            | "hr"
+            | "menu"
+            | "nav"
+            | "ol"
+            | "p"
+            | "pre"
+            | "section"
+            | "table"
+            | "ul"
+    )
 }
 
 fn close_element(stack: &mut Vec<Node>, tag_name: &str) {
@@ -761,7 +993,7 @@ fn collect_visible_text(node: &Node, output: &mut VisibleText) {
             if block {
                 output.push_newlines(2);
             }
-            for child in &node.children {
+            for child in node.render_children() {
                 collect_visible_text(child, output);
             }
             if block {
@@ -771,7 +1003,7 @@ fn collect_visible_text(node: &Node, output: &mut VisibleText) {
             }
         }
         NodeKind::Document => {
-            for child in &node.children {
+            for child in node.render_children() {
                 collect_visible_text(child, output);
             }
         }
@@ -779,7 +1011,7 @@ fn collect_visible_text(node: &Node, output: &mut VisibleText) {
 }
 
 fn is_hidden_from_visible_text(tag_name: &str) -> bool {
-    matches!(tag_name, "head" | "script" | "style" | "noscript")
+    matches!(tag_name, "head" | "title" | "script" | "style" | "noscript")
 }
 
 fn is_block_element(tag_name: &str) -> bool {
@@ -826,6 +1058,13 @@ fn dump_node(node: &Node, depth: usize, output: &mut String) {
     for child in &node.children {
         dump_node(child, depth + 1, output);
     }
+    if !node.shadow_children.is_empty() {
+        output.push_str(&indent);
+        output.push_str("#shadow-root\n");
+        for child in &node.shadow_children {
+            dump_node(child, depth + 1, output);
+        }
+    }
 }
 
 fn escape_dump_string(input: &str) -> String {
@@ -855,7 +1094,8 @@ mod tests {
     use super::{
         ScriptContent, collect_external_scripts, collect_icon_links, collect_iframes,
         collect_inline_scripts, collect_resource_hints, collect_scripts, collect_stylesheet_links,
-        dump_dom, extract_visible_text, parse_document,
+        dump_dom, extract_document_title, extract_visible_text, parse_document,
+        parse_document_with_diagnostics,
     };
     use webby_dom::{Document, Node, NodeKind};
 
@@ -868,11 +1108,49 @@ mod tests {
     }
 
     #[test]
+    fn oversized_html_input_returns_structured_error() {
+        let html = "x".repeat(super::MAX_HTML_INPUT_BYTES + 1);
+        let result = parse_document_with_diagnostics(&html);
+
+        assert!(matches!(
+            result,
+            Err(webby_core::WebbyError::Parse { message })
+                if message.contains("HTML input") && message.contains("limit")
+        ));
+    }
+
+    #[test]
+    fn dom_node_limit_returns_structured_error() {
+        let mut html = String::new();
+        for _ in 0..super::MAX_DOM_NODES {
+            html.push_str("<span></span>");
+        }
+
+        let result = parse_document_with_diagnostics(&html);
+
+        assert!(matches!(
+            result,
+            Err(webby_core::WebbyError::Parse { message })
+                if message.contains("DOM node limit")
+        ));
+    }
+
+    #[test]
     fn parses_nested_normal_tags() -> webby_core::WebbyResult<()> {
         let document = parse_document("<html><body><h1>Hello</h1><p>World</p></body></html>")?;
 
         assert_eq!(extract_visible_text(&document), "Hello\n\nWorld");
         assert!(dump_dom(&document).contains("<h1>"));
+        Ok(())
+    }
+
+    #[test]
+    fn document_title_extraction_uses_first_trimmed_title() -> webby_core::WebbyResult<()> {
+        let document = parse_document(
+            "<head><title>  First title  </title><title>Second title</title></head><body>Visible</body>",
+        )?;
+
+        assert_eq!(extract_document_title(&document), "First title");
         Ok(())
     }
 
@@ -963,6 +1241,116 @@ mod tests {
         let document = parse_document("<div><p>Hello</div> tail</p>")?;
 
         assert_eq!(extract_visible_text(&document), "Hello\n\ntail");
+        Ok(())
+    }
+
+    #[test]
+    fn optional_end_tags_recover_common_list_table_and_paragraph_markup()
+    -> webby_core::WebbyResult<()> {
+        let document = parse_document(
+            "<p>one<span> inline<div>block</div><ul><li>first<li>second</ul><table><thead><tr><th>A<th>B<tbody><tr><td>1<td>2<tr><td>3<td>4</table>",
+        )?;
+        let dump = dump_dom(&document);
+
+        assert!(dump.contains("<p>\n    \"one\"\n    <span>\n      \" inline\"\n  <div>"));
+        assert!(dump.contains("<li>\n      \"first\"\n    <li>\n      \"second\""));
+        assert!(dump.contains("<th>\n          \"A\"\n        <th>\n          \"B\""));
+        assert!(dump.contains("<td>\n          \"1\"\n        <td>\n          \"2\""));
+        assert!(dump.contains("<td>\n          \"3\"\n        <td>\n          \"4\""));
+        Ok(())
+    }
+
+    #[test]
+    fn optional_end_tag_recovery_respects_nested_list_and_table_scopes()
+    -> webby_core::WebbyResult<()> {
+        let document = parse_document(
+            "<ul><li>outer<ul><li>inner<li>second</ul><li>tail</ul><table><tr><td>outer<table><tr><td>inner</table><td>tail</table>",
+        )?;
+        let dump = dump_dom(&document);
+
+        assert!(
+            dump.contains("<li>\n      \"outer\"\n      <ul>\n        <li>\n          \"inner\"")
+        );
+        assert!(dump.contains("<li>\n          \"second\"\n    <li>\n      \"tail\""));
+        assert!(dump.contains(
+            "<td>\n        \"outer\"\n        <table>\n          <tr>\n            <td>\n              \"inner\""
+        ));
+        assert!(dump.contains("<td>\n        \"tail\""));
+        Ok(())
+    }
+
+    #[test]
+    fn escapable_raw_text_elements_preserve_markup_like_text_and_decode_entities()
+    -> webby_core::WebbyResult<()> {
+        let document =
+            parse_document("<title>A &amp; <b>literal</title><textarea>x &lt; <i>y</textarea>")?;
+        let dump = dump_dom(&document);
+
+        assert!(dump.contains("<title>\n    \"A & <b>literal\""));
+        assert!(dump.contains("<textarea>\n    \"x < <i>y\""));
+        Ok(())
+    }
+
+    #[test]
+    fn title_is_hidden_from_visible_text_even_outside_head() -> webby_core::WebbyResult<()> {
+        let document = parse_document("<title>Metadata</title><p>Visible</p>")?;
+
+        assert_eq!(extract_visible_text(&document), "Visible");
+        Ok(())
+    }
+
+    #[test]
+    fn unclosed_escapable_raw_text_is_preserved_with_diagnostic() -> webby_core::WebbyResult<()> {
+        let parsed = parse_document_with_diagnostics("<textarea>x &amp; <b>literal")?;
+
+        assert!(dump_dom(&parsed.document).contains("\"x & <b>literal\""));
+        assert_eq!(
+            parsed.diagnostics[0].message,
+            "unclosed textarea element preserved through end of input"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn raw_text_elements_do_not_decode_entities() -> webby_core::WebbyResult<()> {
+        let document = parse_document("<script>const x = '&amp;';</script>")?;
+
+        assert!(dump_dom(&document).contains("\"const x = '&amp;';\""));
+        Ok(())
+    }
+
+    #[test]
+    fn parser_recovery_diagnostics_are_deterministic() -> webby_core::WebbyResult<()> {
+        let parsed = parse_document_with_diagnostics("<p>kept<!-- missing")?;
+
+        assert_eq!(extract_visible_text(&parsed.document), "kept");
+        assert_eq!(parsed.diagnostics.len(), 1);
+        assert_eq!(parsed.diagnostics[0].offset, 7);
+        assert_eq!(
+            parsed.diagnostics[0].message,
+            "unclosed comment ignored through end of input"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn foreign_content_fallback_keeps_unknown_tree_content() -> webby_core::WebbyResult<()> {
+        let document = parse_document("<svg><foreignObject><p>Fallback</foreignObject></svg>")?;
+        let dump = dump_dom(&document);
+
+        assert!(dump.contains("<svg>"));
+        assert!(dump.contains("<foreignobject>"));
+        assert_eq!(extract_visible_text(&document), "Fallback");
+        Ok(())
+    }
+
+    #[test]
+    fn checked_in_optional_end_tag_fixture_matches_expected_dump() -> webby_core::WebbyResult<()> {
+        let input = include_str!("../../../tests/fixtures/malformed/html-optional-end-tags.html");
+        let expected =
+            include_str!("../../../tests/fixtures/expected/html-optional-end-tags.dom.txt");
+
+        assert_eq!(dump_dom(&parse_document(input)?), expected);
         Ok(())
     }
 

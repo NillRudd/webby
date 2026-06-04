@@ -11,6 +11,9 @@ use webby_html::{ScriptContent, ScriptElement};
 use webby_js::ScriptSource;
 use webby_net::{ResourceLoader, decode_text_utf8};
 
+/// Maximum JavaScript source bytes retained by script coordination.
+pub const MAX_SCRIPT_SOURCE_BYTES: usize = 256 * 1024;
+
 /// Ordered scripts and non-fatal diagnostics for a document.
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct LoadedScripts {
@@ -106,11 +109,17 @@ impl<'a, L: ResourceLoader> ScriptLoader<'a, L> {
 
     fn classic_source(&mut self, script: ScriptElement) -> Option<OrderedScriptSource> {
         match script.content {
-            ScriptContent::Inline(code) => Some(OrderedScriptSource {
-                source: ScriptSource::new(script.label, code),
-                defer: script.defer,
-                async_attr: script.async_attr,
-            }),
+            ScriptContent::Inline(code) => {
+                let label = script.label;
+                if !self.script_source_within_limit(&label, code.len()) {
+                    return None;
+                }
+                Some(OrderedScriptSource {
+                    source: ScriptSource::new(label, code),
+                    defer: script.defer,
+                    async_attr: script.async_attr,
+                })
+            }
             ScriptContent::External(src) => {
                 self.load_external_classic(script.label, src, script.defer, script.async_attr)
             }
@@ -136,6 +145,9 @@ impl<'a, L: ResourceLoader> ScriptLoader<'a, L> {
         match script.content {
             ScriptContent::Inline(code) => {
                 let label = script.label;
+                if !self.script_source_within_limit(&label, code.len()) {
+                    return;
+                }
                 let sources = self.module_sources(label, self.page_url, code);
                 self.modules.extend(sources);
             }
@@ -194,12 +206,16 @@ impl<'a, L: ResourceLoader> ScriptLoader<'a, L> {
         let result = loader.load(module_url);
         let sources = match result {
             Ok(response) => {
-                let code = decode_text_utf8(&response.bytes);
-                self.module_sources(
-                    format!("module {}", response.final_url),
-                    &response.final_url,
-                    code,
-                )
+                if !self.script_source_within_limit(&key, response.bytes.len()) {
+                    Vec::new()
+                } else {
+                    let code = decode_text_utf8(&response.bytes);
+                    self.module_sources(
+                        format!("module {}", response.final_url),
+                        &response.final_url,
+                        code,
+                    )
+                }
             }
             Err(error) => {
                 self.diagnostics.push(format!(
@@ -222,7 +238,12 @@ impl<'a, L: ResourceLoader> ScriptLoader<'a, L> {
         };
         let script_url = self.resolve_script_url(label, src)?;
         match loader.load(&script_url) {
-            Ok(response) => Some((response.final_url, decode_text_utf8(&response.bytes))),
+            Ok(response) => {
+                if !self.script_source_within_limit(script_url.as_ref(), response.bytes.len()) {
+                    return None;
+                }
+                Some((response.final_url, decode_text_utf8(&response.bytes)))
+            }
             Err(error) => {
                 self.diagnostics.push(format!(
                     "JavaScript skipped {label} {}: failed to load script: {error}",
@@ -231,6 +252,16 @@ impl<'a, L: ResourceLoader> ScriptLoader<'a, L> {
                 None
             }
         }
+    }
+
+    fn script_source_within_limit(&mut self, label: &str, byte_len: usize) -> bool {
+        if byte_len <= MAX_SCRIPT_SOURCE_BYTES {
+            return true;
+        }
+        self.diagnostics.push(format!(
+            "JavaScript skipped {label}: script is {byte_len} bytes, limit is {MAX_SCRIPT_SOURCE_BYTES} bytes"
+        ));
+        false
     }
 
     fn resolve_script_url(&mut self, label: &str, src: &str) -> Option<url::Url> {
@@ -423,6 +454,49 @@ mod tests {
         assert_eq!(
             loaded.diagnostics,
             vec!["JavaScript module inline script 1 skipped unsupported import syntax".to_string()]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn oversized_inline_script_is_skipped_with_diagnostic() -> WebbyResult<()> {
+        let page = url::Url::parse("https://example.test/page").map_err(url_error)?;
+        let code = "a".repeat(super::MAX_SCRIPT_SOURCE_BYTES + 1);
+        let document = webby_html::parse_document(&format!("<script>{code}</script>"))?;
+
+        let loaded = load_document_scripts::<TestLoader>(&document, &page, None);
+
+        assert!(loaded.scripts.is_empty());
+        assert_eq!(
+            loaded.diagnostics,
+            vec![format!(
+                "JavaScript skipped inline script 1: script is {} bytes, limit is {} bytes",
+                super::MAX_SCRIPT_SOURCE_BYTES + 1,
+                super::MAX_SCRIPT_SOURCE_BYTES
+            )]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn oversized_external_script_is_skipped_with_diagnostic() -> WebbyResult<()> {
+        let page = url::Url::parse("https://example.test/page").map_err(url_error)?;
+        let script_url = url::Url::parse("https://example.test/big.js").map_err(url_error)?;
+        let code = "a".repeat(super::MAX_SCRIPT_SOURCE_BYTES + 1);
+        let loader = TestLoader::new([(script_url.as_str(), code.as_str())]);
+        let document = webby_html::parse_document("<script src=\"big.js\"></script>")?;
+
+        let loaded = load_document_scripts(&document, &page, Some(&loader));
+
+        assert!(loaded.scripts.is_empty());
+        assert_eq!(
+            loaded.diagnostics,
+            vec![format!(
+                "JavaScript skipped {}: script is {} bytes, limit is {} bytes",
+                script_url,
+                super::MAX_SCRIPT_SOURCE_BYTES + 1,
+                super::MAX_SCRIPT_SOURCE_BYTES
+            )]
         );
         Ok(())
     }

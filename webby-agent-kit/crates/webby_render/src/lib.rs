@@ -6,8 +6,8 @@
 use webby_core::{WebbyError, WebbyResult};
 use webby_layout::{
     FontFamily as LayoutFontFamily, FontWeight as LayoutFontWeight, GraphicCommand, InlineFragment,
-    LayoutBox, LayoutItem, LayoutKind, LayoutTree, Rect, TextDecoration as LayoutTextDecoration,
-    VisualColor,
+    LayoutBox, LayoutItem, LayoutKind, LayoutTree, Rect, ScrollOffsets,
+    TextDecoration as LayoutTextDecoration, VisualColor,
 };
 use webby_text::{FontFamily as TextFontFamily, FontWeight as TextFontWeight};
 
@@ -158,6 +158,10 @@ pub struct Point {
 /// Renderer command produced from layout.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DisplayCommand {
+    /// Begin clipping subsequent commands to a layout viewport.
+    PushClip { rect: Rect },
+    /// End the most recently pushed clip scope.
+    PopClip,
     /// Fill a rectangle.
     FillRect { rect: Rect, color: Color },
     /// Draw a text run.
@@ -222,8 +226,16 @@ impl DisplayList {
 
 /// Builds an ordered display list from layout output.
 pub fn build_display_list(layout: &LayoutTree) -> DisplayList {
+    build_display_list_with_scroll_offsets(layout, &ScrollOffsets::new())
+}
+
+/// Builds an ordered display list with app-owned per-container scroll offsets.
+pub fn build_display_list_with_scroll_offsets(
+    layout: &LayoutTree,
+    offsets: &ScrollOffsets,
+) -> DisplayList {
     let mut list = DisplayList::empty();
-    append_box_commands(&layout.root, &mut list);
+    append_box_commands(&layout.root, offsets, 0.0, 0.0, &mut list);
     list
 }
 
@@ -236,6 +248,11 @@ pub fn dump_display_list(list: &DisplayList) -> String {
 
     for command in &list.commands {
         match command {
+            DisplayCommand::PushClip { rect } => {
+                output.push_str("  push-clip rect=");
+                output.push_str(&format_rect(*rect));
+            }
+            DisplayCommand::PopClip => output.push_str("  pop-clip"),
             DisplayCommand::FillRect { rect, color } => {
                 output.push_str("  fill rect=");
                 output.push_str(&format_rect(*rect));
@@ -353,7 +370,7 @@ pub fn dump_display_list(list: &DisplayList) -> String {
 }
 
 /// In-memory RGBA rendering surface.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct Surface {
     /// Width in pixels.
     pub width: usize,
@@ -361,6 +378,7 @@ pub struct Surface {
     pub height: usize,
     /// RGBA pixels in row-major order.
     pub pixels: Vec<u8>,
+    clip_stack: Vec<Rect>,
 }
 
 impl Surface {
@@ -395,6 +413,7 @@ impl Surface {
             width,
             height,
             pixels,
+            clip_stack: Vec::new(),
         })
     }
 
@@ -403,6 +422,7 @@ impl Surface {
         for command in &list.commands {
             self.render_command(command);
         }
+        self.clip_stack.clear();
     }
 
     /// Draws text directly onto the surface using Webby's shared text engine.
@@ -452,6 +472,10 @@ impl Surface {
 
     fn render_command(&mut self, command: &DisplayCommand) {
         match command {
+            DisplayCommand::PushClip { rect } => self.push_clip(*rect),
+            DisplayCommand::PopClip => {
+                self.clip_stack.pop();
+            }
             DisplayCommand::FillRect { rect, color } => self.fill_rect(*rect, *color),
             DisplayCommand::DrawText {
                 text,
@@ -523,6 +547,19 @@ impl Surface {
         }
     }
 
+    fn push_clip(&mut self, rect: Rect) {
+        let clipped = match self.clip_stack.last().copied() {
+            Some(current) => intersect_rect(current, rect).unwrap_or(Rect {
+                x: 0.0,
+                y: 0.0,
+                width: 0.0,
+                height: 0.0,
+            }),
+            None => rect,
+        };
+        self.clip_stack.push(clipped);
+    }
+
     fn circle(
         &mut self,
         center: Point,
@@ -540,7 +577,7 @@ impl Surface {
             width: radius * 2.0,
             height: radius * 2.0,
         };
-        let Some(bounds) = clip_rect(rect, self.width, self.height) else {
+        let Some(bounds) = self.clipped_rect(rect) else {
             return;
         };
         let radius_sq = radius * radius;
@@ -572,7 +609,7 @@ impl Surface {
             return;
         }
 
-        let Some(bounds) = clip_rect(rect, self.width, self.height) else {
+        let Some(bounds) = self.clipped_rect(rect) else {
             return;
         };
 
@@ -737,7 +774,7 @@ impl Surface {
         if expected_len > pixels.len() {
             return;
         }
-        let Some(bounds) = clip_rect(rect, self.width, self.height) else {
+        let Some(bounds) = self.clipped_rect(rect) else {
             return;
         };
         let source_width = image_width as f32;
@@ -777,6 +814,11 @@ impl Surface {
     }
 
     fn blend_pixel(&mut self, x: usize, y: usize, color: Color) {
+        if let Some(clip) = self.clip_stack.last()
+            && !point_in_rect(x as f32, y as f32, *clip)
+        {
+            return;
+        }
         let Some(index) = y
             .checked_mul(self.width)
             .and_then(|row| row.checked_add(x))
@@ -804,13 +846,64 @@ impl Surface {
         self.pixels[index + 2] = blend_channel(color.b, self.pixels[index + 2], alpha, inverse);
         self.pixels[index + 3] = 255;
     }
+
+    fn clipped_rect(&self, rect: Rect) -> Option<ClippedRect> {
+        let rect = match self.clip_stack.last().copied() {
+            Some(clip) => intersect_rect(rect, clip)?,
+            None => rect,
+        };
+        clip_rect(rect, self.width, self.height)
+    }
+}
+
+/// Backend abstraction for turning backend-neutral display lists into pixels.
+pub trait RenderBackend {
+    /// Stable backend identifier for diagnostics and configuration.
+    fn name(&self) -> &'static str;
+
+    /// Renders a display list into a surface of the requested size.
+    fn render_display_list(
+        &self,
+        list: &DisplayList,
+        width: usize,
+        height: usize,
+    ) -> WebbyResult<Surface>;
+}
+
+/// Deterministic software renderer used by tests, CLI, and the native app.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct SoftwareRenderBackend;
+
+impl RenderBackend for SoftwareRenderBackend {
+    fn name(&self) -> &'static str {
+        "software"
+    }
+
+    fn render_display_list(
+        &self,
+        list: &DisplayList,
+        width: usize,
+        height: usize,
+    ) -> WebbyResult<Surface> {
+        let mut surface = Surface::new(width, height, Color::WHITE)?;
+        surface.render_display_list(list);
+        Ok(surface)
+    }
+}
+
+/// Renders a display list through an explicit backend.
+pub fn render_with_backend<B: RenderBackend>(
+    backend: &B,
+    list: &DisplayList,
+    width: usize,
+    height: usize,
+) -> WebbyResult<Surface> {
+    backend.render_display_list(list, width, height)
 }
 
 /// Renders a display list to a white RGBA surface.
 pub fn render_to_surface(list: &DisplayList, width: usize, height: usize) -> WebbyResult<Surface> {
-    let mut surface = Surface::new(width, height, Color::WHITE)?;
-    surface.render_display_list(list);
-    Ok(surface)
+    render_with_backend(&SoftwareRenderBackend, list, width, height)
 }
 
 /// Draws the current value overlay for a text/search form control.
@@ -869,8 +962,14 @@ pub fn draw_text_control_overlay(
     surface.render_display_list(&list);
 }
 
-fn append_box_commands(layout_box: &LayoutBox, list: &mut DisplayList) {
-    let border_box = layout_box.dimensions.border_box();
+fn append_box_commands(
+    layout_box: &LayoutBox,
+    offsets: &ScrollOffsets,
+    dx: f32,
+    dy: f32,
+    list: &mut DisplayList,
+) {
+    let border_box = translate(layout_box.dimensions.border_box(), dx, dy);
     let background = Color::from(layout_box.visuals.background_color);
     if background.is_visible() && has_area(border_box) {
         list.commands.push(DisplayCommand::FillRect {
@@ -901,34 +1000,56 @@ fn append_box_commands(layout_box: &LayoutBox, list: &mut DisplayList) {
         if graphics.is_empty() {
             match image {
                 Some(resource) => list.commands.push(DisplayCommand::DrawImage {
-                    rect: layout_box.dimensions.content,
+                    rect: translate(layout_box.dimensions.content, dx, dy),
                     image_width: resource.image.width,
                     image_height: resource.image.height,
                     pixels: resource.image.pixels.clone(),
                 }),
                 None => list.commands.push(DisplayCommand::ImagePlaceholder {
-                    rect: layout_box.dimensions.content,
+                    rect: translate(layout_box.dimensions.content, dx, dy),
                     border_color,
                 }),
             }
         } else {
-            append_graphic_commands(layout_box.dimensions.content, graphics, list);
+            append_graphic_commands(
+                translate(layout_box.dimensions.content, dx, dy),
+                graphics,
+                list,
+            );
         }
     }
 
+    let (child_dx, child_dy, clipped) = match &layout_box.scroll_container {
+        Some(container) => {
+            let offset =
+                container.clamp_offset(offsets.get(&container.id).copied().unwrap_or_default());
+            list.commands.push(DisplayCommand::PushClip {
+                rect: translate(container.viewport, dx, dy),
+            });
+            (dx - offset.x, dy - offset.y, true)
+        }
+        None => (dx, dy, false),
+    };
     for item in &layout_box.contents {
         match item {
             LayoutItem::LineBox(line) => {
                 for fragment in &line.fragments {
                     match fragment {
-                        InlineFragment::Text(run) => append_text_commands(run, list),
-                        InlineFragment::Box(child) => append_box_commands(child, list),
+                        InlineFragment::Text(run) => {
+                            append_text_commands(run, child_dx, child_dy, list)
+                        }
+                        InlineFragment::Box(child) => {
+                            append_box_commands(child, offsets, child_dx, child_dy, list)
+                        }
                     }
                 }
             }
-            LayoutItem::Text(run) => append_text_commands(run, list),
-            LayoutItem::Box(child) => append_box_commands(child, list),
+            LayoutItem::Text(run) => append_text_commands(run, child_dx, child_dy, list),
+            LayoutItem::Box(child) => append_box_commands(child, offsets, child_dx, child_dy, list),
         }
+    }
+    if clipped {
+        list.commands.push(DisplayCommand::PopClip);
     }
 }
 
@@ -997,7 +1118,7 @@ fn translate_rect(origin: Rect, rect: Rect) -> Rect {
     }
 }
 
-fn append_text_commands(run: &webby_layout::TextRun, list: &mut DisplayList) {
+fn append_text_commands(run: &webby_layout::TextRun, dx: f32, dy: f32, list: &mut DisplayList) {
     if run.text.is_empty() || !has_area(run.rect) {
         return;
     }
@@ -1005,7 +1126,7 @@ fn append_text_commands(run: &webby_layout::TextRun, list: &mut DisplayList) {
     let color = Color::from(run.visuals.color);
     list.commands.push(DisplayCommand::DrawText {
         text: run.text.clone(),
-        rect: run.rect,
+        rect: translate(run.rect, dx, dy),
         font_size: run.font_size,
         font_weight: FontWeight::from(run.visuals.font_weight),
         font_family: FontFamily::from(run.visuals.font_family),
@@ -1015,17 +1136,43 @@ fn append_text_commands(run: &webby_layout::TextRun, list: &mut DisplayList) {
     });
 
     if run.visuals.text_decoration == LayoutTextDecoration::Underline {
-        let y = run.rect.y + run.rect.height - 2.0;
+        let rect = translate(run.rect, dx, dy);
+        let y = rect.y + rect.height - 2.0;
         list.commands.push(DisplayCommand::Line {
-            from: Point { x: run.rect.x, y },
+            from: Point { x: rect.x, y },
             to: Point {
-                x: run.rect.x + run.rect.width,
+                x: rect.x + rect.width,
                 y,
             },
             color,
             width: 1.0,
         });
     }
+}
+
+fn translate(rect: Rect, dx: f32, dy: f32) -> Rect {
+    Rect {
+        x: rect.x + dx,
+        y: rect.y + dy,
+        ..rect
+    }
+}
+
+fn intersect_rect(left: Rect, right: Rect) -> Option<Rect> {
+    let x = left.x.max(right.x);
+    let y = left.y.max(right.y);
+    let right_edge = (left.x + left.width).min(right.x + right.width);
+    let bottom = (left.y + left.height).min(right.y + right.height);
+    (right_edge > x && bottom > y).then_some(Rect {
+        x,
+        y,
+        width: right_edge - x,
+        height: bottom - y,
+    })
+}
+
+fn point_in_rect(x: f32, y: f32, rect: Rect) -> bool {
+    x >= rect.x && x < rect.x + rect.width && y >= rect.y && y < rect.y + rect.height
 }
 
 fn max_edge(edges: webby_layout::EdgeSizes) -> f32 {
@@ -1125,9 +1272,9 @@ fn escape_dump_string(input: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        Color, DisplayCommand, FontFamily, FontWeight, FormControlVisualState, Surface,
-        TextDecoration, build_display_list, draw_text_control_overlay, dump_display_list,
-        render_to_surface,
+        Color, DisplayCommand, FontFamily, FontWeight, FormControlVisualState, RenderBackend,
+        SoftwareRenderBackend, Surface, TextDecoration, build_display_list,
+        draw_text_control_overlay, dump_display_list, render_to_surface, render_with_backend,
     };
     use webby_core::WebbyResult;
     use webby_layout::{
@@ -1139,6 +1286,54 @@ mod tests {
     #[test]
     fn empty_display_list_has_no_commands() {
         assert!(super::DisplayList::empty().commands.is_empty());
+    }
+
+    #[test]
+    fn software_backend_has_stable_identity_and_renders_display_list() -> WebbyResult<()> {
+        let backend = SoftwareRenderBackend;
+        let list = super::DisplayList {
+            commands: vec![DisplayCommand::FillRect {
+                rect: Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 2.0,
+                    height: 2.0,
+                },
+                color: Color::BLACK,
+            }],
+        };
+
+        let surface = render_with_backend(&backend, &list, 2, 2)?;
+
+        assert_eq!(backend.name(), "software");
+        assert_eq!(surface.pixels[0..4], [0, 0, 0, 255]);
+        Ok(())
+    }
+
+    #[test]
+    fn compatibility_render_helper_uses_deterministic_software_backend() -> WebbyResult<()> {
+        let list = super::DisplayList {
+            commands: vec![DisplayCommand::FillRect {
+                rect: Rect {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 1.0,
+                    height: 1.0,
+                },
+                color: Color {
+                    r: 8,
+                    g: 16,
+                    b: 32,
+                    a: 255,
+                },
+            }],
+        };
+
+        let backend_surface = render_with_backend(&SoftwareRenderBackend, &list, 2, 2)?;
+        let helper_surface = render_to_surface(&list, 2, 2)?;
+
+        assert_eq!(backend_surface, helper_surface);
+        Ok(())
     }
 
     #[test]
@@ -1603,6 +1798,38 @@ mod tests {
     }
 
     #[test]
+    fn scoped_clip_commands_limit_subtree_pixels() -> WebbyResult<()> {
+        let list = super::DisplayList {
+            commands: vec![
+                DisplayCommand::PushClip {
+                    rect: Rect {
+                        x: 1.0,
+                        y: 1.0,
+                        width: 2.0,
+                        height: 2.0,
+                    },
+                },
+                DisplayCommand::FillRect {
+                    rect: Rect {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 4.0,
+                        height: 4.0,
+                    },
+                    color: Color::BLACK,
+                },
+                DisplayCommand::PopClip,
+            ],
+        };
+        let surface = render_to_surface(&list, 4, 4)?;
+
+        assert_eq!(pixel(&surface, 0, 0), [255, 255, 255, 255]);
+        assert_eq!(pixel(&surface, 1, 1), [0, 0, 0, 255]);
+        assert_eq!(pixel(&surface, 3, 3), [255, 255, 255, 255]);
+        Ok(())
+    }
+
+    #[test]
     fn rendered_text_changes_pixels_in_expected_region() -> WebbyResult<()> {
         let list = super::DisplayList {
             commands: vec![DisplayCommand::DrawText {
@@ -1809,6 +2036,7 @@ mod tests {
                 },
                 positioning: Positioning::default(),
                 flow: LayoutFlow::Block,
+                scroll_container: None,
                 contents: vec![
                     LayoutItem::Text(TextRun {
                         rect: Rect {
@@ -1878,6 +2106,7 @@ mod tests {
                         },
                         positioning: Positioning::default(),
                         flow: LayoutFlow::Block,
+                        scroll_container: None,
                         contents: Vec::new(),
                     }),
                 ],
@@ -1896,6 +2125,7 @@ mod tests {
                 visuals: transparent_box_visuals(),
                 positioning: Positioning::default(),
                 flow: LayoutFlow::Block,
+                scroll_container: None,
                 contents: vec![
                     LayoutItem::Text(TextRun {
                         rect: Rect {
@@ -1922,6 +2152,7 @@ mod tests {
                         visuals: transparent_box_visuals(),
                         positioning: Positioning::default(),
                         flow: LayoutFlow::Block,
+                        scroll_container: None,
                         contents: Vec::new(),
                     }),
                     LayoutItem::Text(TextRun {
@@ -1951,6 +2182,7 @@ mod tests {
                 visuals: transparent_box_visuals(),
                 positioning: Positioning::default(),
                 flow: LayoutFlow::Block,
+                scroll_container: None,
                 contents: vec![LayoutItem::Box(LayoutBox {
                     kind: LayoutKind::Image {
                         tag_name: "img".to_string(),
@@ -1973,6 +2205,7 @@ mod tests {
                     visuals: transparent_box_visuals(),
                     positioning: Positioning::default(),
                     flow: LayoutFlow::Block,
+                    scroll_container: None,
                     contents: Vec::new(),
                 })],
             },
@@ -1990,6 +2223,7 @@ mod tests {
                 visuals: transparent_box_visuals(),
                 positioning: Positioning::default(),
                 flow: LayoutFlow::Block,
+                scroll_container: None,
                 contents: vec![LayoutItem::LineBox(LineBox {
                     rect: Rect {
                         x: 0.0,
@@ -2024,6 +2258,7 @@ mod tests {
                             visuals: transparent_box_visuals(),
                             positioning: Positioning::default(),
                             flow: LayoutFlow::Block,
+                            scroll_container: None,
                             contents: Vec::new(),
                         }),
                         InlineFragment::Text(TextRun {

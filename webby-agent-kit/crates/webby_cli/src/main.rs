@@ -5,6 +5,7 @@ use std::process::ExitCode;
 
 use clap::Parser;
 use webby_core::{WebbyError, WebbyResult};
+use webby_net::ResourceLoader;
 use webby_url::SearchEngine;
 
 const MAX_RENDER_VIEWPORT_WIDTH: f32 = 8192.0;
@@ -19,6 +20,12 @@ struct Args {
     /// Fetch a resource URL.
     #[arg(long)]
     fetch: Option<String>,
+    /// Download resource bytes to an explicit output path.
+    #[arg(long)]
+    download: Option<String>,
+    /// HTTP Basic credentials for --fetch or --download as user:password.
+    #[arg(long)]
+    basic_auth: Option<String>,
     /// Dump a parsed DOM tree for an HTML file.
     #[arg(long)]
     dump_dom: Option<PathBuf>,
@@ -58,6 +65,9 @@ struct Args {
     /// Print persistent Webby profile config.
     #[arg(long)]
     show_config: bool,
+    /// Print a deterministic profile data summary.
+    #[arg(long)]
+    profile_summary: bool,
     /// List persistent successful navigation history.
     #[arg(long)]
     list_history: bool,
@@ -73,6 +83,21 @@ struct Args {
     /// Clear persistent cookies from the profile.
     #[arg(long)]
     clear_cookies: bool,
+    /// Clear persistent successful navigation history and recent pages.
+    #[arg(long)]
+    clear_history: bool,
+    /// Clear persistent bookmarks.
+    #[arg(long)]
+    clear_bookmarks: bool,
+    /// Clear persistent localStorage from the profile.
+    #[arg(long)]
+    clear_local_storage: bool,
+    /// Clear all persisted browsing data controlled by Webby's profile store.
+    #[arg(long)]
+    clear_browsing_data: bool,
+    /// Clear persistent resource bytes from the profile cache.
+    #[arg(long)]
+    clear_cache: bool,
     /// Profile directory for persistence commands.
     #[arg(long)]
     profile_dir: Option<PathBuf>,
@@ -103,8 +128,29 @@ fn run(args: Args) -> WebbyResult<()> {
             "clear_cookies_on_exit={}",
             profile.config.clear_cookies_on_exit
         );
+        println!("clear_data_on_exit={}", profile.config.clear_data_on_exit);
         println!("javascript_enabled={}", profile.config.javascript_enabled);
+        println!("storage_enabled={}", profile.config.storage_enabled);
+        println!("disk_cache_enabled={}", profile.config.disk_cache_enabled);
         println!("profile_dir={}", profile_store(&args)?.root().display());
+        return Ok(());
+    }
+
+    if args.profile_summary {
+        let profile = load_profile(&args)?;
+        let store = profile_store(&args)?;
+        println!("profile_dir={}", store.root().display());
+        println!("history_entries={}", profile.history.entries.len());
+        println!("recent_pages={}", profile.recent.pages.len());
+        println!("bookmarks={}", profile.bookmarks.bookmarks.len());
+        println!("cookies={}", profile.cookies.cookies.len());
+        println!(
+            "local_storage_origins={}",
+            profile.local_storage.origins.len()
+        );
+        println!("disk_cache_enabled={}", profile.config.disk_cache_enabled);
+        println!("storage_enabled={}", profile.config.storage_enabled);
+        println!("cookies_enabled={}", profile.config.cookies_enabled);
         return Ok(());
     }
 
@@ -121,6 +167,45 @@ fn run(args: Args) -> WebbyResult<()> {
         let mut profile = store.load()?;
         store.clear_cookies(&mut profile)?;
         println!("cleared cookies");
+        return Ok(());
+    }
+
+    if args.clear_history {
+        let store = profile_store(&args)?;
+        let mut profile = store.load()?;
+        store.clear_history(&mut profile)?;
+        println!("cleared history");
+        return Ok(());
+    }
+
+    if args.clear_bookmarks {
+        let store = profile_store(&args)?;
+        let mut profile = store.load()?;
+        store.clear_bookmarks(&mut profile)?;
+        println!("cleared bookmarks");
+        return Ok(());
+    }
+
+    if args.clear_local_storage {
+        let store = profile_store(&args)?;
+        let mut profile = store.load()?;
+        store.clear_local_storage(&mut profile)?;
+        println!("cleared localStorage");
+        return Ok(());
+    }
+
+    if args.clear_browsing_data {
+        let store = profile_store(&args)?;
+        let mut profile = store.load()?;
+        store.clear_browsing_data(&mut profile)?;
+        println!("cleared browsing data");
+        return Ok(());
+    }
+
+    if args.clear_cache {
+        let store = profile_store(&args)?;
+        webby_cache::DiskResourceCache::open(store.cache_dir())?.clear()?;
+        println!("cleared cache");
         return Ok(());
     }
 
@@ -160,17 +245,42 @@ fn run(args: Args) -> WebbyResult<()> {
         return Ok(());
     }
 
-    if let Some(raw_url) = args.fetch {
-        let url = url::Url::parse(&raw_url).map_err(|error| WebbyError::Url {
+    if let Some(raw_url) = &args.fetch {
+        let url = url::Url::parse(raw_url).map_err(|error| WebbyError::Url {
             message: error.to_string(),
         })?;
-        let response = webby_net::load_resource(&url)?;
+        let loader = webby_net::DefaultResourceLoader::new()?;
+        let response = loader.load_with_headers(&url, &basic_auth_headers(&args)?)?;
         println!(
             "requested={} final={} status={:?} content_type={:?} bytes={}",
             response.requested_url,
             response.final_url,
             response.status,
             response.content_type,
+            response.byte_len()
+        );
+        return Ok(());
+    }
+
+    if let Some(raw_url) = &args.download {
+        let Some(output) = &args.output else {
+            return Err(WebbyError::invalid_input(
+                "--download requires --output <path>",
+            ));
+        };
+        let url = url::Url::parse(raw_url).map_err(|error| WebbyError::Url {
+            message: error.to_string(),
+        })?;
+        let loader = webby_net::DefaultResourceLoader::new()?;
+        let response = loader.load_with_headers(&url, &basic_auth_headers(&args)?)?;
+        std::fs::write(output, &response.bytes).map_err(|source| WebbyError::Io {
+            path: Some(output.clone()),
+            source,
+        })?;
+        println!(
+            "downloaded={} output={} bytes={}",
+            response.final_url,
+            output.display(),
             response.byte_len()
         );
         return Ok(());
@@ -264,22 +374,34 @@ fn reject_irrelevant_options(args: &Args) -> WebbyResult<()> {
         ));
     }
 
-    if args.output.is_some() && args.render_ppm.is_none() {
+    if args.output.is_some() && args.render_ppm.is_none() && args.download.is_none() {
         return Err(WebbyError::invalid_input(
-            "--output may only be used with --render-ppm",
+            "--output may only be used with --render-ppm or --download",
         ));
     }
 
     if args.profile_dir.is_some()
         && !args.show_config
+        && !args.profile_summary
         && !args.list_history
         && !args.list_bookmarks
         && args.add_bookmark.is_none()
         && args.remove_bookmark.is_none()
         && !args.clear_cookies
+        && !args.clear_history
+        && !args.clear_bookmarks
+        && !args.clear_local_storage
+        && !args.clear_browsing_data
+        && !args.clear_cache
     {
         return Err(WebbyError::invalid_input(
             "--profile-dir may only be used with profile commands",
+        ));
+    }
+
+    if args.basic_auth.is_some() && args.fetch.is_none() && args.download.is_none() {
+        return Err(WebbyError::invalid_input(
+            "--basic-auth may only be used with --fetch or --download",
         ));
     }
 
@@ -290,6 +412,7 @@ fn reject_multiple_commands(args: &Args) -> WebbyResult<()> {
     let commands = [
         ("--resolve-input", args.resolve_input.is_some()),
         ("--fetch", args.fetch.is_some()),
+        ("--download", args.download.is_some()),
         ("--dump-dom", args.dump_dom.is_some()),
         ("--dump-text", args.dump_text.is_some()),
         ("--dump-style", args.dump_style.is_some()),
@@ -300,11 +423,17 @@ fn reject_multiple_commands(args: &Args) -> WebbyResult<()> {
         ("--render-ppm", args.render_ppm.is_some()),
         ("--render-snapshot", args.render_snapshot.is_some()),
         ("--show-config", args.show_config),
+        ("--profile-summary", args.profile_summary),
         ("--list-history", args.list_history),
         ("--list-bookmarks", args.list_bookmarks),
         ("--add-bookmark", args.add_bookmark.is_some()),
         ("--remove-bookmark", args.remove_bookmark.is_some()),
         ("--clear-cookies", args.clear_cookies),
+        ("--clear-history", args.clear_history),
+        ("--clear-bookmarks", args.clear_bookmarks),
+        ("--clear-local-storage", args.clear_local_storage),
+        ("--clear-browsing-data", args.clear_browsing_data),
+        ("--clear-cache", args.clear_cache),
     ];
     let selected = commands
         .iter()
@@ -336,6 +465,25 @@ fn parse_profile_url(value: &str) -> WebbyResult<url::Url> {
     url::Url::parse(value).map_err(|error| WebbyError::Url {
         message: format!("invalid profile URL {value:?}: {error}"),
     })
+}
+
+fn basic_auth_headers(args: &Args) -> WebbyResult<Vec<(String, String)>> {
+    let Some(raw) = args.basic_auth.as_deref() else {
+        return Ok(Vec::new());
+    };
+    let Some((username, password)) = raw.split_once(':') else {
+        return Err(WebbyError::invalid_input(
+            "--basic-auth must be formatted as user:password",
+        ));
+    };
+    if username.is_empty() {
+        return Err(WebbyError::invalid_input(
+            "--basic-auth username must not be empty",
+        ));
+    }
+    Ok(vec![webby_net::basic_auth_header(
+        &webby_net::BasicCredentials::new(username, password),
+    )])
 }
 
 fn unsupported_existing_file_command(
@@ -370,7 +518,7 @@ fn dump_style_file(path: &std::path::Path) -> WebbyResult<String> {
     let loader = webby_net::DefaultResourceLoader::new()?;
     let cache = webby_cache::ResourceCache::new();
     let cached_loader = webby_cache::CachedResourceLoader::new(&loader, &cache);
-    let (mut document, base_url) = load_html_file_with_url(path, &cached_loader)?;
+    let (mut document, base_url, html_diagnostics) = load_html_file_with_url(path, &cached_loader)?;
     let javascript_diagnostics =
         execute_document_scripts(&mut document, &base_url, &cached_loader)?;
     let loaded = webby_stylesheet::load_external_stylesheets(&document, &base_url, &cached_loader);
@@ -383,6 +531,7 @@ fn dump_style_file(path: &std::path::Path) -> WebbyResult<String> {
         .collect::<Vec<_>>();
     Ok(format_cli_diagnostics(&collect_stylesheet_diagnostics(
         &[
+            html_diagnostics,
             cache_diagnostics,
             loaded.diagnostics,
             javascript_diagnostics,
@@ -396,7 +545,7 @@ fn dump_css_file(path: &std::path::Path) -> WebbyResult<String> {
     let loader = webby_net::DefaultResourceLoader::new()?;
     let cache = webby_cache::ResourceCache::new();
     let cached_loader = webby_cache::CachedResourceLoader::new(&loader, &cache);
-    let (mut document, base_url) = load_html_file_with_url(path, &cached_loader)?;
+    let (mut document, base_url, html_diagnostics) = load_html_file_with_url(path, &cached_loader)?;
     let javascript_diagnostics =
         execute_document_scripts(&mut document, &base_url, &cached_loader)?;
     let loaded = webby_stylesheet::load_external_stylesheets(&document, &base_url, &cached_loader);
@@ -408,6 +557,7 @@ fn dump_css_file(path: &std::path::Path) -> WebbyResult<String> {
         .collect::<Vec<_>>();
     let diagnostics = collect_stylesheet_diagnostics(
         &[
+            html_diagnostics,
             cache_diagnostics,
             loaded.diagnostics,
             javascript_diagnostics,
@@ -464,7 +614,12 @@ fn render_ppm_file(
     let display_list = webby_render::build_display_list(&layout_output.layout);
     let surface_width = width.ceil().max(1.0) as usize;
     let surface_height = layout_output.layout.scroll_height.ceil().max(1.0) as usize;
-    let surface = webby_render::render_to_surface(&display_list, surface_width, surface_height)?;
+    let surface = webby_render::render_with_backend(
+        &webby_render::SoftwareRenderBackend,
+        &display_list,
+        surface_width,
+        surface_height,
+    )?;
     std::fs::write(output, surface.to_ppm()).map_err(|source| WebbyError::Io {
         path: Some(output.to_path_buf()),
         source,
@@ -484,7 +639,7 @@ fn layout_file_with_width(path: &std::path::Path, width: f32) -> WebbyResult<Lay
     let loader = webby_net::DefaultResourceLoader::new()?;
     let cache = webby_cache::ResourceCache::new();
     let cached_loader = webby_cache::CachedResourceLoader::new(&loader, &cache);
-    let (mut document, base_url) = load_html_file_with_url(path, &cached_loader)?;
+    let (mut document, base_url, html_diagnostics) = load_html_file_with_url(path, &cached_loader)?;
     let javascript_diagnostics =
         execute_document_scripts(&mut document, &base_url, &cached_loader)?;
     let decoded = webby_image::load_images(&document, &base_url, &cached_loader);
@@ -508,6 +663,7 @@ fn layout_file_with_width(path: &std::path::Path, width: f32) -> WebbyResult<Lay
         layout,
         diagnostics: collect_stylesheet_diagnostics(
             &[
+                html_diagnostics,
                 cache_diagnostics,
                 loaded.diagnostics,
                 javascript_diagnostics,
@@ -587,11 +743,20 @@ fn format_cli_diagnostics(diagnostics: &[String]) -> String {
 fn load_html_file_with_url<L: webby_net::ResourceLoader>(
     path: &std::path::Path,
     loader: &L,
-) -> WebbyResult<(webby_dom::Document, url::Url)> {
+) -> WebbyResult<(webby_dom::Document, url::Url, Vec<String>)> {
     let url = html_file_url(path)?;
     let response = loader.load(&url)?;
-    let html = webby_net::decode_text_utf8(&response.bytes);
-    Ok((webby_html::parse_document(&html)?, response.final_url))
+    let html = webby_net::decode_text(&response.bytes, response.content_type.as_deref());
+    let parsed = webby_html::parse_document_with_diagnostics(&html)?;
+    Ok((
+        parsed.document,
+        response.final_url,
+        parsed
+            .diagnostics
+            .into_iter()
+            .map(|diagnostic| diagnostic.to_string())
+            .collect(),
+    ))
 }
 
 fn html_file_url(path: &std::path::Path) -> WebbyResult<url::Url> {
@@ -639,8 +804,8 @@ fn parse_html_file(path: &std::path::Path) -> WebbyResult<webby_dom::Document> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Args, dump_css_file, dump_diagnostics_file, dump_display_list_file, dump_dom_file,
-        dump_layout_file, dump_style_file, dump_text_file, load_html_file_with_url,
+        Args, basic_auth_headers, dump_css_file, dump_diagnostics_file, dump_display_list_file,
+        dump_dom_file, dump_layout_file, dump_style_file, dump_text_file, load_html_file_with_url,
         parse_viewport_width, render_ppm_file, run,
     };
     use base64::Engine;
@@ -653,6 +818,8 @@ mod tests {
         Args {
             resolve_input: None,
             fetch: None,
+            download: None,
+            basic_auth: None,
             dump_dom: None,
             dump_text: None,
             dump_style: None,
@@ -666,11 +833,17 @@ mod tests {
             render_snapshot: None,
             out: None,
             show_config: false,
+            profile_summary: false,
             list_history: false,
             list_bookmarks: false,
             add_bookmark: None,
             remove_bookmark: None,
             clear_cookies: false,
+            clear_history: false,
+            clear_bookmarks: false,
+            clear_local_storage: false,
+            clear_browsing_data: false,
+            clear_cache: false,
             profile_dir: None,
         }
     }
@@ -741,6 +914,76 @@ mod tests {
         let result = run(args);
 
         assert!(matches!(result, Err(WebbyError::Url { .. })));
+    }
+
+    #[test]
+    fn download_command_writes_explicit_output() -> webby_core::WebbyResult<()> {
+        let output =
+            std::env::temp_dir().join(format!("webby-cli-download-{}.txt", std::process::id()));
+        let _ = std::fs::remove_file(&output);
+        let mut args = empty_args();
+        args.download = Some("data:text/plain,hello".to_string());
+        args.output = Some(output.clone());
+
+        run(args)?;
+
+        let bytes = std::fs::read(&output).map_err(|source| WebbyError::Io {
+            path: Some(output.clone()),
+            source,
+        })?;
+        let _ = std::fs::remove_file(output);
+        assert_eq!(bytes, b"hello");
+        Ok(())
+    }
+
+    #[test]
+    fn download_command_requires_output() {
+        let mut args = empty_args();
+        args.download = Some("data:text/plain,hello".to_string());
+
+        let result = run(args);
+
+        assert!(matches!(result, Err(WebbyError::InvalidInput { .. })));
+    }
+
+    #[test]
+    fn basic_auth_option_builds_redactable_header_for_resource_commands()
+    -> webby_core::WebbyResult<()> {
+        let mut args = empty_args();
+        args.fetch = Some("data:text/plain,hello".to_string());
+        args.basic_auth = Some("webby:secret".to_string());
+
+        let headers = basic_auth_headers(&args)?;
+
+        assert_eq!(headers.len(), 1);
+        assert_eq!(headers[0].0, "Authorization");
+        assert!(
+            format!("{:?}", webby_net::redact_request_headers(&headers)).contains("<redacted>")
+        );
+        assert!(!format!("{headers:?}").contains("secret"));
+        Ok(())
+    }
+
+    #[test]
+    fn basic_auth_option_is_rejected_for_non_resource_commands() {
+        let mut args = empty_args();
+        args.dump_text = Some(fixture_path("simple.html"));
+        args.basic_auth = Some("webby:secret".to_string());
+
+        let result = run(args);
+
+        assert!(matches!(result, Err(WebbyError::InvalidInput { .. })));
+    }
+
+    #[test]
+    fn malformed_basic_auth_option_is_structured_error() {
+        let mut args = empty_args();
+        args.fetch = Some("data:text/plain,hello".to_string());
+        args.basic_auth = Some("missing-colon".to_string());
+
+        let result = run(args);
+
+        assert!(matches!(result, Err(WebbyError::InvalidInput { .. })));
     }
 
     #[test]
@@ -845,6 +1088,114 @@ mod tests {
         run(args)?;
 
         assert!(store.load()?.cookies.cookies.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn clear_cache_command_removes_persisted_resource_bytes() -> webby_core::WebbyResult<()> {
+        let profile_dir = temp_profile_dir("clear-cache-command");
+        let store = webby_state::ProfileStore::new(&profile_dir);
+        let disk = webby_cache::DiskResourceCache::open(store.cache_dir())?;
+        let memory = webby_cache::ResourceCache::new();
+        let loader = CountingSingleResourceLoader::new(
+            "https://example.test/page",
+            "text/plain",
+            b"cached".to_vec(),
+        );
+        let url =
+            url::Url::parse("https://example.test/page").map_err(|error| WebbyError::Url {
+                message: error.to_string(),
+            })?;
+        webby_cache::CachedResourceLoader::new(&loader, &memory)
+            .with_disk_cache(&disk)
+            .load(&url)?;
+        let mut args = empty_args();
+        args.clear_cache = true;
+        args.profile_dir = Some(profile_dir);
+
+        run(args)?;
+
+        assert!(
+            std::fs::read_dir(store.cache_dir())
+                .map(|entries| entries.count() == 0)
+                .unwrap_or(false)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn privacy_clear_commands_update_profile_data() -> webby_core::WebbyResult<()> {
+        let profile_dir = temp_profile_dir("privacy-clear-commands");
+        let store = webby_state::ProfileStore::new(&profile_dir);
+        let url = url::Url::parse("https://example.test/").map_err(|error| WebbyError::Url {
+            message: error.to_string(),
+        })?;
+        let mut profile = webby_state::BrowserProfile::default();
+        store.record_successful_navigation(&mut profile, &url)?;
+        store.add_bookmark(&mut profile, &url)?;
+        profile
+            .local_storage
+            .set_item("https://example.test:443", "theme", "dark")?;
+        store.save(&profile)?;
+
+        let mut summary = empty_args();
+        summary.profile_summary = true;
+        summary.profile_dir = Some(profile_dir.clone());
+        run(summary)?;
+
+        let mut clear_history = empty_args();
+        clear_history.clear_history = true;
+        clear_history.profile_dir = Some(profile_dir.clone());
+        run(clear_history)?;
+        assert!(store.load()?.history.entries.is_empty());
+        assert!(store.load()?.recent.pages.is_empty());
+
+        let mut clear_bookmarks = empty_args();
+        clear_bookmarks.clear_bookmarks = true;
+        clear_bookmarks.profile_dir = Some(profile_dir.clone());
+        run(clear_bookmarks)?;
+        assert!(store.load()?.bookmarks.bookmarks.is_empty());
+
+        let mut clear_local_storage = empty_args();
+        clear_local_storage.clear_local_storage = true;
+        clear_local_storage.profile_dir = Some(profile_dir);
+        run(clear_local_storage)?;
+        assert!(store.load()?.local_storage.origins.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn clear_browsing_data_command_clears_profile_without_corrupting_config()
+    -> webby_core::WebbyResult<()> {
+        let profile_dir = temp_profile_dir("clear-browsing-data-command");
+        let store = webby_state::ProfileStore::new(&profile_dir);
+        let url = url::Url::parse("https://example.test/").map_err(|error| WebbyError::Url {
+            message: error.to_string(),
+        })?;
+        let mut profile = webby_state::BrowserProfile {
+            config: webby_state::BrowserConfig {
+                homepage: "https://home.example/".to_string(),
+                ..webby_state::BrowserConfig::default()
+            },
+            ..webby_state::BrowserProfile::default()
+        };
+        store.record_successful_navigation(&mut profile, &url)?;
+        store.add_bookmark(&mut profile, &url)?;
+        profile
+            .local_storage
+            .set_item("https://example.test:443", "theme", "dark")?;
+        store.save(&profile)?;
+
+        let mut args = empty_args();
+        args.clear_browsing_data = true;
+        args.profile_dir = Some(profile_dir);
+        run(args)?;
+        let loaded = store.load()?;
+
+        assert_eq!(loaded.config.homepage, "https://home.example/");
+        assert!(loaded.history.entries.is_empty());
+        assert!(loaded.bookmarks.bookmarks.is_empty());
+        assert!(loaded.local_storage.origins.is_empty());
         Ok(())
     }
 
@@ -1031,6 +1382,18 @@ mod tests {
         assert!(dump.contains("diagnostic: JavaScript error in inline script 2"));
         assert!(dump.contains("diagnostic: JavaScript console: cli 31"));
         assert!(dump.contains("diagnostics count="));
+        Ok(())
+    }
+
+    #[test]
+    fn dump_diagnostics_includes_html_parser_recovery() -> webby_core::WebbyResult<()> {
+        let html = write_temp_html("webby-html-diagnostics", "<body>Visible<!-- missing")?;
+        let dump = dump_diagnostics_file(&html, Some("180"))?;
+        let _ = std::fs::remove_file(&html);
+
+        assert!(dump.contains(
+            "diagnostic: HTML diagnostic at byte 13: unclosed comment ignored through end of input"
+        ));
         Ok(())
     }
 

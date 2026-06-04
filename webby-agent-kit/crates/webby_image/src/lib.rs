@@ -11,6 +11,11 @@ use webby_core::{WebbyError, WebbyResult};
 use webby_dom::{Document, Node, NodeKind};
 use webby_net::ResourceLoader;
 
+/// Maximum decoded image pixels accepted by the decoder.
+pub const MAX_DECODED_IMAGE_PIXELS: u64 = 16_000_000;
+/// Maximum decoded RGBA bytes retained for one image.
+pub const MAX_DECODED_IMAGE_BYTES: u64 = MAX_DECODED_IMAGE_PIXELS * 4;
+
 /// A decoded image in RGBA8 pixels.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecodedImage {
@@ -166,16 +171,40 @@ pub fn decode_image(bytes: &[u8]) -> WebbyResult<DecodedImage> {
         .map_err(|error| WebbyError::Parse {
             message: format!("failed to guess image format: {error}"),
         })?;
+    let (width, height) = reader
+        .into_dimensions()
+        .map_err(|error| WebbyError::Parse {
+            message: format!("failed to read image dimensions: {error}"),
+        })?;
+    validate_decoded_dimensions(width, height)?;
+    let reader = ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .map_err(|error| WebbyError::Parse {
+            message: format!("failed to guess image format: {error}"),
+        })?;
     let image = reader.decode().map_err(|error| WebbyError::Parse {
         message: format!("failed to decode image: {error}"),
     })?;
     let rgba = image.to_rgba8();
 
     Ok(DecodedImage {
-        width: rgba.width(),
-        height: rgba.height(),
+        width,
+        height,
         pixels: rgba.into_raw(),
     })
+}
+
+fn validate_decoded_dimensions(width: u32, height: u32) -> WebbyResult<()> {
+    let pixel_count = u64::from(width).saturating_mul(u64::from(height));
+    let byte_count = pixel_count.saturating_mul(4);
+    if pixel_count > MAX_DECODED_IMAGE_PIXELS || byte_count > MAX_DECODED_IMAGE_BYTES {
+        return Err(WebbyError::Parse {
+            message: format!(
+                "decoded image is {width}x{height} ({byte_count} RGBA bytes), limit is {MAX_DECODED_IMAGE_PIXELS} pixels"
+            ),
+        });
+    }
+    Ok(())
 }
 
 fn collect_from_node(node: &Node, references: &mut Vec<ImageReference>) {
@@ -339,6 +368,39 @@ mod tests {
         assert_eq!((decoded.width, decoded.height), (2, 1));
         assert_eq!(decoded.pixels.len(), 2 * 4);
         Ok(())
+    }
+
+    #[test]
+    fn oversized_decoded_image_dimensions_are_rejected() {
+        let result = super::validate_decoded_dimensions(4_001, 4_000);
+
+        assert!(matches!(
+            result,
+            Err(WebbyError::Parse { message })
+                if message.contains("decoded image") && message.contains("limit")
+        ));
+    }
+
+    #[test]
+    fn generated_decoder_boundary_inputs_fail_deterministically_without_panicking() {
+        let prefixes = [
+            &[][..],
+            b"\x89PNG\r\n\x1a\n".as_slice(),
+            b"\xff\xd8\xff".as_slice(),
+            b"GIF89a".as_slice(),
+            b"not an image".as_slice(),
+        ];
+
+        for prefix in prefixes {
+            for extra_len in 0..=32 {
+                let mut bytes = prefix.to_vec();
+                bytes.extend((0..extra_len).map(|index| (index % 251) as u8));
+                let first = decode_image(&bytes);
+                let second = decode_image(&bytes);
+
+                assert_eq!(format!("{first:?}"), format!("{second:?}"));
+            }
+        }
     }
 
     #[test]

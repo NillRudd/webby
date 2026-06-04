@@ -3,9 +3,10 @@
 use std::collections::BTreeMap;
 
 use webby_css::{
-    Combinator, Declaration, GridPlacement as CssGridPlacement, GridTrack as CssGridTrack,
-    MediaFeature, MediaQuery, MediaType, Orientation, Property, PseudoClass, Selector,
-    SelectorPart, Size, Specificity, Stylesheet, TransitionProperty as CssTransitionProperty,
+    Combinator, CssWideKeyword, Declaration, GridPlacement as CssGridPlacement,
+    GridTrack as CssGridTrack, MediaFeature, MediaQuery, MediaType, Orientation, Property,
+    PseudoClass, Selector, SelectorPart, Size, Specificity, Stylesheet,
+    TransitionProperty as CssTransitionProperty,
     TransitionTimingFunction as CssTransitionTimingFunction, Value,
 };
 use webby_dom::{Document, ElementData, Node, NodeKind};
@@ -152,6 +153,41 @@ pub enum Visibility {
     Visible,
     /// Keeps layout but does not paint or interact.
     Hidden,
+}
+
+/// CSS overflow behavior for one axis.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Overflow {
+    /// Content may paint outside the box.
+    Visible,
+    /// Content is clipped without scrolling.
+    Hidden,
+    /// Content is clipped and scrollable.
+    Scroll,
+    /// Content is clipped and scrollable when needed.
+    Auto,
+}
+
+impl Overflow {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Visible => "visible",
+            Self::Hidden => "hidden",
+            Self::Scroll => "scroll",
+            Self::Auto => "auto",
+        }
+    }
+}
+
+impl From<webby_css::Overflow> for Overflow {
+    fn from(value: webby_css::Overflow) -> Self {
+        match value {
+            webby_css::Overflow::Visible => Self::Visible,
+            webby_css::Overflow::Hidden => Self::Hidden,
+            webby_css::Overflow::Scroll => Self::Scroll,
+            webby_css::Overflow::Auto => Self::Auto,
+        }
+    }
 }
 
 impl Visibility {
@@ -680,6 +716,10 @@ pub struct ComputedStyle {
     pub display: Display,
     /// Visibility behavior.
     pub visibility: Visibility,
+    /// Horizontal overflow behavior.
+    pub overflow_x: Overflow,
+    /// Vertical overflow behavior.
+    pub overflow_y: Overflow,
     /// CSS positioning mode.
     pub position: Position,
     /// Optional top offset.
@@ -761,6 +801,8 @@ impl Default for ComputedStyle {
         Self {
             display: Display::Inline,
             visibility: Visibility::Visible,
+            overflow_x: Overflow::Visible,
+            overflow_y: Overflow::Visible,
             position: Position::Static,
             top: None,
             right: None,
@@ -958,6 +1000,7 @@ pub fn compose_document_stylesheet(
         combined.rules.extend(embedded.rules);
         combined.diagnostics.extend(embedded.diagnostics);
     }
+    collect_inline_style_diagnostics(&document.root, &mut combined.diagnostics);
 
     combined
 }
@@ -1069,7 +1112,7 @@ fn style_visible_node<'a>(
 
     ancestors.push(node);
     let children = node
-        .children
+        .render_children()
         .iter()
         .filter_map(|child| style_visible_node(child, &style, stylesheet, context, ancestors))
         .collect();
@@ -1086,6 +1129,8 @@ fn text_style(parent_style: &ComputedStyle) -> ComputedStyle {
     ComputedStyle {
         display: Display::Inline,
         visibility: parent_style.visibility,
+        overflow_x: Overflow::Visible,
+        overflow_y: Overflow::Visible,
         position: Position::Static,
         top: None,
         right: None,
@@ -1420,18 +1465,41 @@ fn element_style(
             };
             style.height = Some(CssSize::Px(20.0));
         }
+        _ if element.tag_name.contains('-') => {
+            style.display = Display::Block;
+        }
         _ => {
             style.display = Display::Inline;
         }
     }
 
-    apply_stylesheet(node, element, ancestors, stylesheet, context, &mut style);
-    apply_inline_style(element, &mut style);
+    let mut tracker = CascadeTracker::default();
+    apply_stylesheet(
+        node,
+        element,
+        ancestors,
+        stylesheet,
+        context,
+        &mut CascadeApplication {
+            parent_style,
+            style: &mut style,
+            tracker: &mut tracker,
+        },
+    );
+    apply_inline_style(
+        element,
+        &mut CascadeApplication {
+            parent_style,
+            style: &mut style,
+            tracker: &mut tracker,
+        },
+    );
     style
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct CascadePriority {
+    important: bool,
     specificity: Specificity,
     order: usize,
 }
@@ -1449,6 +1517,8 @@ struct CascadeTracker {
     white_space: Option<CascadePriority>,
     display: Option<CascadePriority>,
     visibility: Option<CascadePriority>,
+    overflow_x: Option<CascadePriority>,
+    overflow_y: Option<CascadePriority>,
     position: Option<CascadePriority>,
     top: Option<CascadePriority>,
     right: Option<CascadePriority>,
@@ -1482,26 +1552,38 @@ struct CascadeTracker {
     transition_timing_function: Option<CascadePriority>,
 }
 
+struct CascadeApplication<'a> {
+    parent_style: &'a ComputedStyle,
+    style: &'a mut ComputedStyle,
+    tracker: &'a mut CascadeTracker,
+}
+
 fn apply_stylesheet(
     node: &Node,
     element: &ElementData,
     ancestors: &[&Node],
     stylesheet: &Stylesheet,
     context: &StyleContext,
-    style: &mut ComputedStyle,
+    application: &mut CascadeApplication<'_>,
 ) {
-    let mut tracker = CascadeTracker::default();
     for (order, rule) in stylesheet.rules.iter().enumerate() {
         if !media_matches(rule.media.as_ref(), context) {
             continue;
         }
         if selector_matches(&rule.selector, node, element, ancestors, context) {
             let priority = CascadePriority {
+                important: false,
                 specificity: rule.selector.specificity(),
                 order,
             };
             for declaration in &rule.declarations {
-                apply_declaration(style, &mut tracker, declaration, priority);
+                apply_declaration(
+                    application.style,
+                    application.tracker,
+                    declaration,
+                    priority,
+                    application.parent_style,
+                );
             }
         }
     }
@@ -1535,14 +1617,13 @@ fn media_feature_matches(feature: MediaFeature, context: &StyleContext) -> bool 
     }
 }
 
-fn apply_inline_style(element: &ElementData, style: &mut ComputedStyle) {
+fn apply_inline_style(element: &ElementData, application: &mut CascadeApplication<'_>) {
     let Some(raw_style) = element.attributes.get("style") else {
         return;
     };
     let Ok((declarations, _diagnostics)) = webby_css::parse_declarations(raw_style) else {
         return;
     };
-    let mut tracker = CascadeTracker::default();
     let specificity = Specificity {
         ids: u16::MAX,
         classes: u16::MAX,
@@ -1550,10 +1631,17 @@ fn apply_inline_style(element: &ElementData, style: &mut ComputedStyle) {
     };
     for (order, declaration) in declarations.iter().enumerate() {
         apply_declaration(
-            style,
-            &mut tracker,
+            application.style,
+            application.tracker,
             declaration,
-            CascadePriority { specificity, order },
+            CascadePriority {
+                important: false,
+                specificity,
+                order: usize::MAX
+                    .saturating_sub(declarations.len())
+                    .saturating_add(order),
+            },
+            application.parent_style,
         );
     }
 }
@@ -1562,8 +1650,21 @@ fn apply_declaration(
     style: &mut ComputedStyle,
     tracker: &mut CascadeTracker,
     declaration: &Declaration,
-    priority: CascadePriority,
+    mut priority: CascadePriority,
+    parent_style: &ComputedStyle,
 ) {
+    priority.important = declaration.important;
+    if let Value::CssWideKeyword(keyword) = declaration.value {
+        apply_css_wide_keyword(
+            style,
+            tracker,
+            declaration.property,
+            keyword,
+            priority,
+            parent_style,
+        );
+        return;
+    }
     match (&declaration.property, &declaration.value) {
         (Property::Color, Value::Color(color)) if should_apply(&mut tracker.color, priority) => {
             style.color = Color::from(*color);
@@ -1620,6 +1721,24 @@ fn apply_declaration(
             if should_apply(&mut tracker.visibility, priority) =>
         {
             style.visibility = Visibility::from(*visibility);
+        }
+        (Property::Overflow, Value::Overflow(overflow)) => {
+            if should_apply(&mut tracker.overflow_x, priority) {
+                style.overflow_x = Overflow::from(*overflow);
+            }
+            if should_apply(&mut tracker.overflow_y, priority) {
+                style.overflow_y = Overflow::from(*overflow);
+            }
+        }
+        (Property::OverflowX, Value::Overflow(overflow))
+            if should_apply(&mut tracker.overflow_x, priority) =>
+        {
+            style.overflow_x = Overflow::from(*overflow);
+        }
+        (Property::OverflowY, Value::Overflow(overflow))
+            if should_apply(&mut tracker.overflow_y, priority) =>
+        {
+            style.overflow_y = Overflow::from(*overflow);
         }
         (Property::Position, Value::Position(position))
             if should_apply(&mut tracker.position, priority) =>
@@ -1814,6 +1933,156 @@ fn apply_declaration(
     }
 }
 
+fn apply_css_wide_keyword(
+    style: &mut ComputedStyle,
+    tracker: &mut CascadeTracker,
+    property: Property,
+    keyword: CssWideKeyword,
+    priority: CascadePriority,
+    parent_style: &ComputedStyle,
+) {
+    let initial = ComputedStyle::default();
+    let source = match keyword {
+        CssWideKeyword::Inherit => parent_style,
+        CssWideKeyword::Initial => &initial,
+        CssWideKeyword::Unset if property_is_inherited(property) => parent_style,
+        CssWideKeyword::Unset => &initial,
+    };
+
+    macro_rules! copy_value {
+        ($tracker:ident, $field:ident) => {
+            if should_apply(&mut tracker.$tracker, priority) {
+                style.$field = source.$field;
+            }
+        };
+    }
+
+    match property {
+        Property::Color => copy_value!(color, color),
+        Property::Background | Property::BackgroundColor => {
+            copy_value!(background_color, background_color)
+        }
+        Property::FontSize => copy_value!(font_size, font_size),
+        Property::FontFamily => copy_value!(font_family, font_family),
+        Property::FontWeight => copy_value!(font_weight, font_weight),
+        Property::LineHeight => copy_value!(line_height, line_height),
+        Property::TextAlign => copy_value!(text_align, text_align),
+        Property::WhiteSpace => copy_value!(white_space, white_space),
+        Property::TextDecoration => copy_value!(text_decoration, text_decoration),
+        Property::Display => copy_value!(display, display),
+        Property::Visibility => copy_value!(visibility, visibility),
+        Property::Overflow => {
+            copy_value!(overflow_x, overflow_x);
+            copy_value!(overflow_y, overflow_y);
+        }
+        Property::OverflowX => copy_value!(overflow_x, overflow_x),
+        Property::OverflowY => copy_value!(overflow_y, overflow_y),
+        Property::Margin => copy_value!(margin, margin),
+        Property::Padding => copy_value!(padding, padding),
+        Property::Border => {
+            if should_apply(&mut tracker.border_width, priority) {
+                style.border.width = source.border.width;
+            }
+            if should_apply(&mut tracker.border_color, priority) {
+                style.border.color = source.border.color;
+            }
+        }
+        Property::BorderWidth => {
+            if should_apply(&mut tracker.border_width, priority) {
+                style.border.width = source.border.width;
+            }
+        }
+        Property::BorderColor => {
+            if should_apply(&mut tracker.border_color, priority) {
+                style.border.color = source.border.color;
+            }
+        }
+        Property::Width => copy_value!(width, width),
+        Property::Height => copy_value!(height, height),
+        Property::MinWidth => copy_value!(min_width, min_width),
+        Property::MaxWidth => copy_value!(max_width, max_width),
+        Property::MinHeight => copy_value!(min_height, min_height),
+        Property::MaxHeight => copy_value!(max_height, max_height),
+        Property::BoxSizing => copy_value!(box_sizing, box_sizing),
+        Property::Position => copy_value!(position, position),
+        Property::Top => copy_value!(top, top),
+        Property::Right => copy_value!(right, right),
+        Property::Bottom => copy_value!(bottom, bottom),
+        Property::Left => copy_value!(left, left),
+        Property::FlexDirection => copy_value!(flex_direction, flex_direction),
+        Property::Gap => {
+            copy_value!(gap, gap);
+            copy_value!(row_gap, row_gap);
+            copy_value!(column_gap, column_gap);
+        }
+        Property::RowGap => copy_value!(row_gap, row_gap),
+        Property::ColumnGap => copy_value!(column_gap, column_gap),
+        Property::GridTemplateColumns => {
+            if should_apply(&mut tracker.grid_template_columns, priority) {
+                style.grid_template_columns = source.grid_template_columns.clone();
+            }
+        }
+        Property::GridTemplateRows => {
+            if should_apply(&mut tracker.grid_template_rows, priority) {
+                style.grid_template_rows = source.grid_template_rows.clone();
+            }
+        }
+        Property::GridColumn => copy_value!(grid_column, grid_column),
+        Property::GridRow => copy_value!(grid_row, grid_row),
+        Property::JustifyContent => copy_value!(justify_content, justify_content),
+        Property::AlignItems => copy_value!(align_items, align_items),
+        Property::Flex | Property::FlexGrow => copy_value!(flex_grow, flex_grow),
+        Property::TransitionProperty => {
+            if should_apply(&mut tracker.transition_property, priority) {
+                style.transition.properties = source.transition.properties.clone();
+            }
+        }
+        Property::TransitionDuration => {
+            if should_apply(&mut tracker.transition_duration, priority) {
+                style.transition.duration_ms = source.transition.duration_ms;
+            }
+        }
+        Property::TransitionDelay => {
+            if should_apply(&mut tracker.transition_delay, priority) {
+                style.transition.delay_ms = source.transition.delay_ms;
+            }
+        }
+        Property::TransitionTimingFunction => {
+            if should_apply(&mut tracker.transition_timing_function, priority) {
+                style.transition.timing_function = source.transition.timing_function;
+            }
+        }
+        Property::Transition => {
+            if should_apply(&mut tracker.transition_property, priority) {
+                style.transition.properties = source.transition.properties.clone();
+            }
+            if should_apply(&mut tracker.transition_duration, priority) {
+                style.transition.duration_ms = source.transition.duration_ms;
+            }
+            if should_apply(&mut tracker.transition_delay, priority) {
+                style.transition.delay_ms = source.transition.delay_ms;
+            }
+            if should_apply(&mut tracker.transition_timing_function, priority) {
+                style.transition.timing_function = source.transition.timing_function;
+            }
+        }
+    }
+}
+
+fn property_is_inherited(property: Property) -> bool {
+    matches!(
+        property,
+        Property::Color
+            | Property::FontFamily
+            | Property::FontSize
+            | Property::FontWeight
+            | Property::LineHeight
+            | Property::TextAlign
+            | Property::Visibility
+            | Property::WhiteSpace
+    )
+}
+
 fn size_if_not_auto(size: Size) -> Option<CssSize> {
     match CssSize::from(size) {
         CssSize::Auto => None,
@@ -1996,7 +2265,7 @@ fn pseudo_class_matches(
 fn element_child_position(node: &Node, ancestors: &[&Node]) -> Option<u32> {
     let parent = ancestors.last()?;
     let mut position = 0u32;
-    for child in &parent.children {
+    for child in parent.render_children() {
         if matches!(child.kind, NodeKind::Element(_)) {
             position = position.saturating_add(1);
         }
@@ -2012,7 +2281,7 @@ fn is_last_element_child(node: &Node, ancestors: &[&Node]) -> bool {
         return false;
     };
     parent
-        .children
+        .render_children()
         .iter()
         .rev()
         .find(|child| matches!(child.kind, NodeKind::Element(_)))
@@ -2031,15 +2300,35 @@ fn collect_style_blocks_from_node(node: &Node, inside_style: bool, blocks: &mut 
         NodeKind::Text(_) => {}
         NodeKind::Element(element) => {
             let style_context = inside_style || element.tag_name == "style";
-            for child in &node.children {
+            for child in node.tree_children() {
                 collect_style_blocks_from_node(child, style_context, blocks);
             }
         }
         NodeKind::Document => {
-            for child in &node.children {
+            for child in node.tree_children() {
                 collect_style_blocks_from_node(child, inside_style, blocks);
             }
         }
+    }
+}
+
+fn collect_inline_style_diagnostics(node: &Node, diagnostics: &mut Vec<webby_css::CssDiagnostic>) {
+    if let NodeKind::Element(element) = &node.kind
+        && let Some(style) = element.attributes.get("style")
+        && let Ok((_, inline_diagnostics)) = webby_css::parse_declarations(style)
+    {
+        diagnostics.extend(inline_diagnostics.into_iter().map(|diagnostic| {
+            webby_css::CssDiagnostic {
+                offset: diagnostic.offset,
+                message: format!(
+                    "inline style on <{}>: {}",
+                    element.tag_name, diagnostic.message
+                ),
+            }
+        }));
+    }
+    for child in node.tree_children() {
+        collect_inline_style_diagnostics(child, diagnostics);
     }
 }
 
@@ -2074,6 +2363,10 @@ fn dump_styled_node(node: &StyledNode<'_>, depth: usize, output: &mut String) {
     output.push_str(&node.style.color.as_rgba());
     output.push_str(" visibility=");
     output.push_str(node.style.visibility.as_str());
+    output.push_str(" overflow-x=");
+    output.push_str(node.style.overflow_x.as_str());
+    output.push_str(" overflow-y=");
+    output.push_str(node.style.overflow_y.as_str());
     output.push_str(" background=");
     output.push_str(&node.style.background_color.as_rgba());
     output.push_str(" font-size=");
@@ -2228,9 +2521,9 @@ fn escape_dump_string(input: &str) -> String {
 mod tests {
     use super::{
         AlignItems, BoxSizing, Color, CssSize, Display, FlexDirection, FontFamily, FontWeight,
-        GridPlacement, GridTrack, JustifyContent, Position, StyleContext, StyleInteraction,
-        TextAlign, TextDecoration, TransitionProperty, TransitionTimingFunction, Visibility,
-        WhiteSpace, compose_document_stylesheet, dump_style_tree, style_document,
+        GridPlacement, GridTrack, JustifyContent, Overflow, Position, StyleContext,
+        StyleInteraction, TextAlign, TextDecoration, TransitionProperty, TransitionTimingFunction,
+        Visibility, WhiteSpace, compose_document_stylesheet, dump_style_tree, style_document,
         style_document_with_css, style_document_with_css_and_context,
         style_document_with_css_for_viewport, style_tree,
     };
@@ -2276,6 +2569,18 @@ mod tests {
         assert_eq!(
             find_first_tag(&styled, "span")?.style.display,
             Display::Inline
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn custom_elements_default_to_block_for_shadow_hosts() -> webby_core::WebbyResult<()> {
+        let document = parse_document("<x-card>Light</x-card>")?;
+        let styled = style_document(&document);
+
+        assert_eq!(
+            find_first_tag(&styled, "x-card")?.style.display,
+            Display::Block
         );
         Ok(())
     }
@@ -2530,6 +2835,21 @@ mod tests {
             find_first_tag(&styled, "a")?.style.display,
             Display::InlineBlock
         );
+        Ok(())
+    }
+
+    #[test]
+    fn css_overflow_shorthand_and_axis_overrides_are_computed() -> webby_core::WebbyResult<()> {
+        let document = parse_document(
+            "<style>.clip { overflow: hidden; overflow-y: auto; }</style><div class=\"clip\">Text</div>",
+        )?;
+        let stylesheet = compose_document_stylesheet(&document, &[]);
+        let styled = style_document_with_css(&document, &stylesheet);
+        let div = find_first_tag(&styled, "div")?;
+
+        assert_eq!(div.style.overflow_x, Overflow::Hidden);
+        assert_eq!(div.style.overflow_y, Overflow::Auto);
+        assert!(dump_style_tree(&styled).contains("overflow-x=hidden overflow-y=auto"));
         Ok(())
     }
 
@@ -3162,6 +3482,74 @@ mod tests {
         assert!(dump.contains("\"Visible\""));
         assert!(!dump.contains("color: red"));
         assert!(!dump.contains("<style>"));
+        Ok(())
+    }
+
+    #[test]
+    fn inherited_text_properties_flow_to_nested_elements() -> webby_core::WebbyResult<()> {
+        let document = parse_document(
+            "<style>.parent { color: red; font-family: monospace; font-size: 22px; font-weight: bold; line-height: 28px; text-align: right; visibility: hidden; }</style><div class=\"parent\"><span>Text</span></div>",
+        )?;
+        let styled = style_document(&document);
+        let span = find_first_tag(&styled, "span")?;
+
+        assert_eq!(span.style.color, red());
+        assert_eq!(span.style.font_family, FontFamily::Monospace);
+        assert_eq!(span.style.font_size, 22.0);
+        assert_eq!(span.style.font_weight, FontWeight::Bold);
+        assert_eq!(span.style.line_height, Some(28.0));
+        assert_eq!(span.style.text_align, TextAlign::Right);
+        assert_eq!(span.style.visibility, Visibility::Hidden);
+        Ok(())
+    }
+
+    #[test]
+    fn css_wide_keywords_resolve_against_parent_or_initial_values() -> webby_core::WebbyResult<()> {
+        let document = parse_document(
+            "<style>.parent { color: red; font-size: 22px; visibility: hidden; padding: 9px; } .child { color: inherit; font-size: unset; visibility: unset; padding: inherit; margin: initial; display: initial; }</style><div class=\"parent\"><div class=\"child\">Text</div></div>",
+        )?;
+        let styled = style_document(&document);
+        let divs = collect_tags(&styled, "div");
+        let child = divs
+            .get(1)
+            .copied()
+            .ok_or_else(|| webby_core::WebbyError::invalid_input("missing child div"))?;
+
+        assert_eq!(child.style.color, red());
+        assert_eq!(child.style.font_size, 22.0);
+        assert_eq!(child.style.visibility, Visibility::Hidden);
+        assert_eq!(child.style.padding, super::Edges::trbl(9.0, 9.0, 9.0, 9.0));
+        assert_eq!(child.style.margin, super::Edges::ZERO);
+        assert_eq!(child.style.display, Display::Inline);
+        Ok(())
+    }
+
+    #[test]
+    fn important_priority_beats_normal_inline_and_inline_important_wins_ties()
+    -> webby_core::WebbyResult<()> {
+        let document = parse_document(
+            "<style>p { color: red !important; } #normal { color: green; }</style><p id=\"normal\" style=\"color: blue\">One</p><p id=\"important\" style=\"color: blue !important\">Two</p>",
+        )?;
+        let styled = style_document(&document);
+        let paragraphs = collect_tags(&styled, "p");
+
+        assert_eq!(paragraphs[0].style.color, red());
+        assert_eq!(paragraphs[1].style.color, blue());
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_inline_style_diagnostic_is_retained_by_composition() -> webby_core::WebbyResult<()>
+    {
+        let document = parse_document("<p style=\"color: invalid\">Text</p>")?;
+        let stylesheet = compose_document_stylesheet(&document, &[]);
+
+        assert_eq!(stylesheet.diagnostics.len(), 1);
+        assert!(
+            stylesheet.diagnostics[0]
+                .message
+                .contains("inline style on <p>: unsupported or invalid declaration")
+        );
         Ok(())
     }
 

@@ -17,6 +17,7 @@ const BOOKMARKS_FILE: &str = "bookmarks.json";
 const RECENT_FILE: &str = "recent.json";
 const COOKIES_FILE: &str = "cookies.json";
 const LOCAL_STORAGE_FILE: &str = "local_storage.json";
+const CACHE_DIR: &str = "cache";
 const MAX_RECENT_PAGES: usize = 25;
 /// Deterministic per-origin Web Storage quota in UTF-8 bytes.
 pub const STORAGE_QUOTA_BYTES: usize = 4096;
@@ -32,6 +33,9 @@ pub struct BrowserConfig {
     pub persist_cookies: bool,
     /// Whether cookies should be cleared when the app exits.
     pub clear_cookies_on_exit: bool,
+    /// Whether persisted browsing data should be cleared when the app exits.
+    #[serde(default)]
+    pub clear_data_on_exit: bool,
     /// Whether inline JavaScript is executed by the page pipeline.
     pub javascript_enabled: bool,
     /// Whether Web Storage APIs are exposed to JavaScript.
@@ -39,6 +43,9 @@ pub struct BrowserConfig {
     /// Whether deterministic visual transitions are enabled.
     #[serde(default = "default_true")]
     pub animations_enabled: bool,
+    /// Whether the optional persistent resource byte cache is enabled.
+    #[serde(default = "default_true")]
+    pub disk_cache_enabled: bool,
 }
 
 fn default_true() -> bool {
@@ -52,9 +59,11 @@ impl Default for BrowserConfig {
             cookies_enabled: true,
             persist_cookies: false,
             clear_cookies_on_exit: false,
+            clear_data_on_exit: false,
             javascript_enabled: true,
             storage_enabled: true,
             animations_enabled: true,
+            disk_cache_enabled: true,
         }
     }
 }
@@ -197,6 +206,22 @@ impl BrowserProfile {
     pub fn clear_cookies(&mut self) {
         self.cookies.clear();
     }
+
+    /// Clears persistent navigation history and recent pages.
+    pub fn clear_history(&mut self) {
+        self.history.entries.clear();
+        self.recent.pages.clear();
+    }
+
+    /// Clears all persisted bookmarks.
+    pub fn clear_bookmarks(&mut self) {
+        self.bookmarks.bookmarks.clear();
+    }
+
+    /// Clears all persisted localStorage values.
+    pub fn clear_local_storage(&mut self) {
+        self.local_storage.clear();
+    }
 }
 
 impl StorageState {
@@ -235,6 +260,11 @@ impl StorageState {
     /// Clears all keys for an origin.
     pub fn clear_origin(&mut self, origin: &str) {
         self.origins.remove(origin);
+    }
+
+    /// Clears all persisted origins and keys.
+    pub fn clear(&mut self) {
+        self.origins.clear();
     }
 
     /// Returns all key/value pairs for an origin in deterministic key order.
@@ -443,6 +473,11 @@ impl ProfileStore {
         &self.root
     }
 
+    /// Returns the persistent resource cache directory for this profile.
+    pub fn cache_dir(&self) -> PathBuf {
+        self.root.join(CACHE_DIR)
+    }
+
     /// Loads a complete profile, using defaults for missing files.
     pub fn load(&self) -> WebbyResult<BrowserProfile> {
         Ok(BrowserProfile {
@@ -505,6 +540,48 @@ impl ProfileStore {
     pub fn clear_cookies(&self, profile: &mut BrowserProfile) -> WebbyResult<()> {
         profile.clear_cookies();
         remove_file_if_exists(self.path(COOKIES_FILE))?;
+        self.save(profile)
+    }
+
+    /// Clears persisted history and recent pages.
+    pub fn clear_history(&self, profile: &mut BrowserProfile) -> WebbyResult<()> {
+        profile.clear_history();
+        remove_file_if_exists(self.path(HISTORY_FILE))?;
+        remove_file_if_exists(self.path(RECENT_FILE))?;
+        self.save(profile)
+    }
+
+    /// Clears persisted bookmarks.
+    pub fn clear_bookmarks(&self, profile: &mut BrowserProfile) -> WebbyResult<()> {
+        profile.clear_bookmarks();
+        remove_file_if_exists(self.path(BOOKMARKS_FILE))?;
+        self.save(profile)
+    }
+
+    /// Clears persisted localStorage.
+    pub fn clear_local_storage(&self, profile: &mut BrowserProfile) -> WebbyResult<()> {
+        profile.clear_local_storage();
+        remove_file_if_exists(self.path(LOCAL_STORAGE_FILE))?;
+        self.save(profile)
+    }
+
+    /// Clears all profile data controlled by Milestone 66 privacy settings.
+    pub fn clear_browsing_data(&self, profile: &mut BrowserProfile) -> WebbyResult<()> {
+        profile.clear_history();
+        profile.clear_bookmarks();
+        profile.clear_cookies();
+        profile.clear_local_storage();
+        remove_file_if_exists(self.path(HISTORY_FILE))?;
+        remove_file_if_exists(self.path(RECENT_FILE))?;
+        remove_file_if_exists(self.path(BOOKMARKS_FILE))?;
+        remove_file_if_exists(self.path(COOKIES_FILE))?;
+        remove_file_if_exists(self.path(LOCAL_STORAGE_FILE))?;
+        if self.cache_dir().exists() {
+            std::fs::remove_dir_all(self.cache_dir()).map_err(|source| WebbyError::Io {
+                path: Some(self.cache_dir()),
+                source,
+            })?;
+        }
         self.save(profile)
     }
 
@@ -762,9 +839,11 @@ mod tests {
                 cookies_enabled: true,
                 persist_cookies: false,
                 clear_cookies_on_exit: false,
+                clear_data_on_exit: false,
                 javascript_enabled: true,
                 storage_enabled: true,
                 animations_enabled: true,
+                disk_cache_enabled: true,
             },
             history: HistoryState {
                 entries: vec!["https://example.test/".to_string()],
@@ -789,7 +868,7 @@ mod tests {
         assert_eq!(first, second);
         assert_eq!(
             first,
-            "{\n  \"homepage\": \"https://example.test/\",\n  \"cookies_enabled\": true,\n  \"persist_cookies\": false,\n  \"clear_cookies_on_exit\": false,\n  \"javascript_enabled\": true,\n  \"storage_enabled\": true,\n  \"animations_enabled\": true\n}\n"
+            "{\n  \"homepage\": \"https://example.test/\",\n  \"cookies_enabled\": true,\n  \"persist_cookies\": false,\n  \"clear_cookies_on_exit\": false,\n  \"clear_data_on_exit\": false,\n  \"javascript_enabled\": true,\n  \"storage_enabled\": true,\n  \"animations_enabled\": true,\n  \"disk_cache_enabled\": true\n}\n"
         );
         Ok(())
     }
@@ -1059,6 +1138,67 @@ mod tests {
         assert!(
             matches!(result, Err(WebbyError::Parse { message }) if message.contains("local_storage.json"))
         );
+        Ok(())
+    }
+
+    #[test]
+    fn clear_helpers_remove_persisted_history_bookmarks_and_local_storage() -> WebbyResult<()> {
+        let store = temp_store("clear-profile-parts");
+        let url = parse_url("https://example.test/")?;
+        let mut profile = BrowserProfile::default();
+        store.record_successful_navigation(&mut profile, &url)?;
+        store.add_bookmark(&mut profile, &url)?;
+        profile
+            .local_storage
+            .set_item("https://example.test:443", "theme", "dark")?;
+        store.save(&profile)?;
+
+        store.clear_history(&mut profile)?;
+        assert!(profile.history.entries.is_empty());
+        assert!(profile.recent.pages.is_empty());
+        assert!(store.load()?.history.entries.is_empty());
+
+        store.clear_bookmarks(&mut profile)?;
+        assert!(profile.bookmarks.bookmarks.is_empty());
+        assert!(store.load()?.bookmarks.bookmarks.is_empty());
+
+        store.clear_local_storage(&mut profile)?;
+        assert!(profile.local_storage.origins.is_empty());
+        assert!(store.load()?.local_storage.origins.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn clear_browsing_data_removes_profile_data_and_cache_directory() -> WebbyResult<()> {
+        let store = temp_store("clear-all-data");
+        let url = parse_url("https://example.test/")?;
+        let mut profile = BrowserProfile {
+            config: BrowserConfig {
+                persist_cookies: true,
+                ..BrowserConfig::default()
+            },
+            ..BrowserProfile::default()
+        };
+        store.record_successful_navigation(&mut profile, &url)?;
+        store.add_bookmark(&mut profile, &url)?;
+        profile
+            .cookies
+            .store_from_headers(&url, &cookie_headers("sid=abc; Path=/; Max-Age=60"));
+        profile
+            .local_storage
+            .set_item("https://example.test:443", "theme", "dark")?;
+        write_file(store.cache_dir().join("body-1.bin"), "cached")?;
+        store.save(&profile)?;
+
+        store.clear_browsing_data(&mut profile)?;
+        let loaded = store.load()?;
+
+        assert!(loaded.history.entries.is_empty());
+        assert!(loaded.recent.pages.is_empty());
+        assert!(loaded.bookmarks.bookmarks.is_empty());
+        assert!(loaded.cookies.cookies.is_empty());
+        assert!(loaded.local_storage.origins.is_empty());
+        assert!(!store.cache_dir().exists());
         Ok(())
     }
 
